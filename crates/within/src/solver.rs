@@ -3,18 +3,24 @@
 //! convenience wrappers built on top of it.
 
 use std::borrow::Cow;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use ndarray::{ArrayView2, Axis};
 use rayon::prelude::*;
-use schwarz_precond::{lsmr as lsmr_solve, mlsmr, MlsmrOptions};
+use schwarz_precond::{
+    lsmr as lsmr_solve, mlsmr, EscalationPolicy, LsmrResult, LsmrStopReason, MlsmrOptions,
+    Staleness,
+};
 
 use crate::channel::Channel;
 use crate::config::{LsmrOptions, PreconditionerConfig};
 use crate::domain::{Design, Effect};
 use crate::observation::ObservationFrame;
 use crate::operator::design::gather_apply;
-use crate::operator::schwarz::{build_preconditioner, Preconditioner};
+use crate::operator::schwarz::{
+    build_diagonal_preconditioner, build_preconditioner, Preconditioner,
+};
 use crate::operator::DesignOperator;
 use crate::{BuildError, BuildWarning, SolveError, WithinError};
 
@@ -225,7 +231,7 @@ pub struct SolveResult {
     pub demeaned: Vec<f64>,
     /// Whether the iterative solver converged within `maxiter` iterations.
     pub converged: bool,
-    /// Number of LSMR iterations used.
+    /// Number of LSMR iterations used (summed across both rungs when escalated).
     pub iterations: usize,
     /// Relative normal-equation residual `||D^T W (y - Dx)|| / ||D^T W y||`,
     /// estimated from the LSMR recurrence (Fong & Saunders) at no extra cost.
@@ -309,7 +315,7 @@ pub struct Solver<'a> {
     /// borrowed by the per-RHS [`DesignOperator`]s (raw weights are needed only
     /// during construction).
     sqrt_weights: Option<Vec<f64>>,
-    preconditioner: Option<Preconditioner>,
+    slot: PrecondSlot,
     reparam: Option<SlopeReparam>,
     warnings: Vec<BuildWarning>,
 }
@@ -320,8 +326,72 @@ impl std::fmt::Debug for Solver<'_> {
             .field("n_obs", &self.design.n_obs)
             .field("n_dofs", &self.design.n_dofs)
             .field("has_weights", &self.sqrt_weights.is_some())
-            .field("has_preconditioner", &self.preconditioner.is_some())
+            .field("preconditioner", &self.slot)
             .finish()
+    }
+}
+
+/// The solver's preconditioner: a fixed map, or an adaptive diagonal→Schwarz ladder.
+enum PrecondSlot {
+    /// A single map (`None` = unpreconditioned) built at construction.
+    Static(Option<Preconditioner>),
+    /// Diagonal now, Schwarz built lazily on a stalled contraction.
+    Adaptive(Box<AdaptivePrecond>),
+}
+
+impl std::fmt::Debug for PrecondSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Static(p) => write!(f, "Static({})", p.is_some()),
+            Self::Adaptive(a) => write!(f, "Adaptive(built={})", a.built.get().is_some()),
+        }
+    }
+}
+
+/// Diagonal-first strategy holding everything needed to build the Schwarz rung on demand.
+struct AdaptivePrecond {
+    base: Preconditioner,
+    stall: Staleness,
+    /// The [`Adaptive`](PreconditionerConfig::Adaptive) config, replayed for the deferred build.
+    config: PreconditionerConfig,
+    /// Raw weights retained for the deferred build; `sqrt(w)²` is not bit-identical to `w`.
+    weights: Option<Vec<f64>>,
+    built: OnceLock<AdaptiveBuild>,
+    /// Serializes the one-time build so concurrent solves escalate exactly once.
+    build_lock: Mutex<()>,
+}
+
+/// Outcome of the deferred build: the Schwarz map, or `None` when no factor-pair target exists.
+struct AdaptiveBuild {
+    schwarz: Option<Preconditioner>,
+    warnings: Vec<BuildWarning>,
+    /// Wall-clock seconds the one-time construction took; a solver-lifecycle fact.
+    build_secs: f64,
+}
+
+impl AdaptivePrecond {
+    /// Build the escalated rung once (double-checked), or return the cached verdict.
+    fn escalated(&self, design: &Design<'_>) -> Result<&AdaptiveBuild, BuildError> {
+        if let Some(built) = self.built.get() {
+            return Ok(built);
+        }
+        let _guard = self
+            .build_lock
+            .lock()
+            .expect("adaptive build lock poisoned");
+        if let Some(built) = self.built.get() {
+            return Ok(built);
+        }
+        let t = Instant::now();
+        let (schwarz, warnings) =
+            build_preconditioner(design, self.weights.as_deref(), Some(&self.config))?;
+        let build_secs = t.elapsed().as_secs_f64();
+        let _ = self.built.set(AdaptiveBuild {
+            schwarz,
+            warnings,
+            build_secs,
+        });
+        Ok(self.built.get().expect("just set"))
     }
 }
 
@@ -375,12 +445,36 @@ impl<'a> Solver<'a> {
         // Reparametrize the slope columns (if any) before the preconditioner reads the frame.
         let reparam = SlopeReparam::build(&mut design, weights.as_deref());
 
-        let (preconditioner, warnings) = match preconditioner.into() {
+        let (slot, warnings) = match preconditioner.into() {
             PreconditionerInput::Default => {
-                build_preconditioner(&design, weights.as_deref(), None)?
+                let (p, w) = build_preconditioner(&design, weights.as_deref(), None)?;
+                (PrecondSlot::Static(p), w)
+            }
+            PreconditionerInput::Config(PreconditionerConfig::Adaptive {
+                local_solver,
+                reduction,
+                stall,
+            }) => {
+                let base = build_diagonal_preconditioner(&design, weights.as_deref())?;
+                (
+                    PrecondSlot::Adaptive(Box::new(AdaptivePrecond {
+                        base,
+                        stall,
+                        config: PreconditionerConfig::Adaptive {
+                            local_solver,
+                            reduction,
+                            stall,
+                        },
+                        weights: weights.clone(),
+                        built: OnceLock::new(),
+                        build_lock: Mutex::new(()),
+                    })),
+                    Vec::new(),
+                )
             }
             PreconditionerInput::Config(c) => {
-                build_preconditioner(&design, weights.as_deref(), Some(&c))?
+                let (p, w) = build_preconditioner(&design, weights.as_deref(), Some(&c))?;
+                (PrecondSlot::Static(p), w)
             }
             PreconditionerInput::Prebuilt(p) => {
                 if p.nrows() != design.n_dofs || p.ncols() != design.n_dofs {
@@ -390,7 +484,7 @@ impl<'a> Solver<'a> {
                         actual_cols: p.ncols(),
                     });
                 }
-                (Some(p), Vec::new())
+                (PrecondSlot::Static(Some(p)), Vec::new())
             }
         };
 
@@ -404,7 +498,7 @@ impl<'a> Solver<'a> {
         Ok(Self {
             design,
             sqrt_weights,
-            preconditioner,
+            slot,
             reparam,
             warnings,
         })
@@ -412,15 +506,22 @@ impl<'a> Solver<'a> {
 
     /// Non-fatal events from the preconditioner build; empty when reusing a
     /// pre-built preconditioner (its warnings were reported when it was built).
+    ///
+    /// For an [`Adaptive`](crate::PreconditionerConfig::Adaptive) solver these
+    /// are the deferred Schwarz build's warnings, and so are empty until a solve
+    /// has escalated (a factorization that never runs produces none).
     pub fn warnings(&self) -> &[BuildWarning] {
-        &self.warnings
+        match &self.slot {
+            PrecondSlot::Static(_) => &self.warnings,
+            PrecondSlot::Adaptive(a) => a.built.get().map(|b| b.warnings.as_slice()).unwrap_or(&[]),
+        }
     }
 
     /// Shared per-RHS solve: validate `y`, run (m)lsmr, demean, and
     /// back-transform slopes. Excludes the design-level `layout` / `warnings` /
     /// `unidentified`, which the public entry points attach once (see
     /// [`RhsSolution`]).
-    fn solve_rhs(&self, y: &[f64], lsmr: &LsmrOptions) -> Result<RhsSolution, SolveError> {
+    fn solve_rhs(&self, y: &[f64], lsmr: &LsmrOptions) -> Result<RhsSolution, WithinError> {
         // `weighted_rhs` zips y with sqrt-weights, silently truncating when `y.len() > n_rows`.
         if y.len() != self.design.n_obs {
             return Err(SolveError::InvalidInput {
@@ -430,13 +531,15 @@ impl<'a> Solver<'a> {
                     y.len(),
                     self.design.n_obs
                 ),
-            });
+            }
+            .into());
         }
         if let Some((index, &value)) = y.iter().enumerate().find(|&(_, &v)| !v.is_finite()) {
             return Err(SolveError::InvalidInput {
                 context: "Solver::solve",
                 message: format!("response at index {index} must be finite, got {value}"),
-            });
+            }
+            .into());
         }
 
         let t_start = Instant::now();
@@ -450,20 +553,13 @@ impl<'a> Solver<'a> {
         let b: &[f64] = &b;
 
         let t_solve_start = Instant::now();
-        let time_setup = t_solve_start.duration_since(t_start).as_secs_f64();
+        let gather_setup = t_solve_start.duration_since(t_start).as_secs_f64();
 
-        let r = match self.preconditioner.as_ref() {
-            Some(p) => {
-                let options = MlsmrOptions {
-                    local_size: lsmr.local_size,
-                    ..Default::default()
-                };
-                mlsmr(&rect_op, b, p, lsmr.tol, lsmr.maxiter, options)?
-            }
-            None => lsmr_solve(&rect_op, b, lsmr.tol, lsmr.maxiter, lsmr.local_size)?,
-        };
+        let (r, build_secs) = self.run_strategy(&rect_op, b, lsmr)?;
 
-        let time_solve = t_solve_start.elapsed().as_secs_f64();
+        // A deferred Schwarz build happens between the two solves: it is setup, not solve.
+        let time_setup = gather_setup + build_secs;
+        let time_solve = t_solve_start.elapsed().as_secs_f64() - build_secs;
 
         // Shapes are guaranteed here, so the bare `D x` matvec is infallible.
         let mut demeaned = vec![0.0; self.design.n_obs];
@@ -490,6 +586,102 @@ impl<'a> Solver<'a> {
         })
     }
 
+    /// Runs the configured preconditioner strategy, returning the LSMR result and the
+    /// wall-clock seconds spent on any deferred build (which callers charge to setup).
+    fn run_strategy(
+        &self,
+        op: &DesignOperator<'_>,
+        b: &[f64],
+        lsmr: &LsmrOptions,
+    ) -> Result<(LsmrResult, f64), WithinError> {
+        match &self.slot {
+            PrecondSlot::Static(None) => {
+                let r = lsmr_solve(op, b, lsmr.tol, lsmr.maxiter, lsmr.local_size)?;
+                Ok((r, 0.0))
+            }
+            PrecondSlot::Static(Some(p)) => {
+                let options = MlsmrOptions {
+                    local_size: lsmr.local_size,
+                    ..Default::default()
+                };
+                let r = mlsmr(op, b, p, lsmr.tol, lsmr.maxiter, options)?;
+                Ok((r, 0.0))
+            }
+            PrecondSlot::Adaptive(a) => self.run_adaptive(a, op, b, lsmr),
+        }
+    }
+
+    /// Diagonal first; on a stalled contraction, build Schwarz and resume from the stalled iterate.
+    fn run_adaptive(
+        &self,
+        a: &AdaptivePrecond,
+        op: &DesignOperator<'_>,
+        b: &[f64],
+        lsmr: &LsmrOptions,
+    ) -> Result<(LsmrResult, f64), WithinError> {
+        // A prior solve that found no escalation target makes this a plain diagonal solve.
+        if a.built.get().is_some_and(|b| b.schwarz.is_none()) {
+            let options = MlsmrOptions {
+                local_size: lsmr.local_size,
+                ..Default::default()
+            };
+            let r = mlsmr(op, b, &a.base, lsmr.tol, lsmr.maxiter, options)?;
+            return Ok((r, 0.0));
+        }
+
+        let run1 = mlsmr(
+            op,
+            b,
+            &a.base,
+            lsmr.tol,
+            lsmr.maxiter,
+            MlsmrOptions {
+                local_size: lsmr.local_size,
+                escalation: Some(&a.stall as &dyn EscalationPolicy),
+                ..Default::default()
+            },
+        )?;
+        if run1.stop_reason != LsmrStopReason::Escalated {
+            return Ok((run1, 0.0));
+        }
+
+        let t_build = Instant::now();
+        let build = a.escalated(&self.design)?;
+        let build_secs = t_build.elapsed().as_secs_f64();
+
+        // The whole ladder shares the caller's budget; the second rung gets what rung 1 left.
+        let remaining = lsmr.maxiter - run1.iterations;
+        // No factor-pair target: transparently finish on the diagonal from the stalled iterate.
+        let rung2 = build.schwarz.as_ref().unwrap_or(&a.base);
+        let mut run2 = mlsmr(
+            op,
+            b,
+            rung2,
+            lsmr.tol,
+            remaining,
+            MlsmrOptions {
+                local_size: lsmr.local_size,
+                warm_start: Some(&run1.x),
+                ..Default::default()
+            },
+        )?;
+        run2.iterations += run1.iterations;
+        Ok((run2, build_secs))
+    }
+
+    /// Whether an [`Adaptive`](crate::PreconditionerConfig::Adaptive) solve has handed off to
+    /// Schwarz. This is a property of the solver's lifecycle: the deferred build fires once and
+    /// is shared across every subsequent solve. Always `false` for the fixed strategies.
+    ///
+    /// After a handoff a converged solve's [`SolveResult::residual`] is anchored at the escalation
+    /// point (the diagonal iterate at handoff) rather than the original right-hand side.
+    pub fn has_escalated(&self) -> bool {
+        match &self.slot {
+            PrecondSlot::Adaptive(a) => a.built.get().is_some_and(|b| b.schwarz.is_some()),
+            PrecondSlot::Static(_) => false,
+        }
+    }
+
     /// Per-level directions the data cannot identify, shared across all RHS:
     /// identification depends only on the design and weights, never on `y`.
     fn unidentified(&self) -> Vec<CoefficientAddress> {
@@ -504,7 +696,7 @@ impl<'a> Solver<'a> {
         &self,
         y: &[f64],
         lsmr: impl Into<Option<&'o LsmrOptions>>,
-    ) -> Result<SolveResult, SolveError> {
+    ) -> Result<SolveResult, WithinError> {
         let default = LsmrOptions::default();
         let lsmr = lsmr.into().unwrap_or(&default);
 
@@ -514,7 +706,8 @@ impl<'a> Solver<'a> {
         Ok(SolveResult {
             x: solution.x,
             unidentified: self.unidentified(),
-            warnings: self.warnings.clone(),
+            // Read after solving so a deferred Adaptive build's warnings are included.
+            warnings: self.warnings().to_vec(),
             layout: CoefficientLayout::from_design(&self.design),
             demeaned: solution.demeaned,
             converged: solution.converged,
@@ -531,7 +724,7 @@ impl<'a> Solver<'a> {
         &self,
         ys: &[&[f64]],
         lsmr: impl Into<Option<&'o LsmrOptions>>,
-    ) -> Result<BatchSolveResult, SolveError> {
+    ) -> Result<BatchSolveResult, WithinError> {
         let t_start = Instant::now();
         let default = LsmrOptions::default();
         let lsmr = lsmr.into().unwrap_or(&default);
@@ -562,14 +755,19 @@ impl<'a> Solver<'a> {
         Ok(BatchSolveResult {
             x,
             unidentified: self.unidentified(),
-            warnings: self.warnings.clone(),
+            // Read after solving so a deferred Adaptive build's warnings are included.
+            warnings: self.warnings().to_vec(),
             layout: CoefficientLayout::from_design(&self.design),
             demeaned,
             converged,
             iterations,
             residual,
             time_solve,
-            time_setup: 0.0,
+            // A batch escalates at most once; the one shared build is reported as setup.
+            time_setup: match &self.slot {
+                PrecondSlot::Adaptive(a) => a.built.get().map_or(0.0, |b| b.build_secs),
+                PrecondSlot::Static(_) => 0.0,
+            },
             time_total: t_start.elapsed().as_secs_f64(),
             n_dofs: self.design.n_dofs,
             n_obs: self.design.n_obs,
@@ -577,8 +775,19 @@ impl<'a> Solver<'a> {
     }
 
     /// Access the preconditioner (for serialization or reuse across solvers).
+    ///
+    /// For an [`Adaptive`](crate::PreconditionerConfig::Adaptive) solver this is
+    /// the escalated Schwarz map once a solve has built it, otherwise the diagonal base.
     pub fn preconditioner(&self) -> Option<&Preconditioner> {
-        self.preconditioner.as_ref()
+        match &self.slot {
+            PrecondSlot::Static(p) => p.as_ref(),
+            PrecondSlot::Adaptive(a) => Some(
+                a.built
+                    .get()
+                    .and_then(|b| b.schwarz.as_ref())
+                    .unwrap_or(&a.base),
+            ),
+        }
     }
 
     /// Number of DOFs (coefficients).

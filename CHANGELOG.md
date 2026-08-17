@@ -13,10 +13,13 @@ and this project follows [Semantic Versioning](https://semver.org/).
 - **BREAKING:** `LsmrStopReason` gains `Escalated` and `WarmStartExact`, breaking exhaustive `match`es.
 - A warm start that already solves the system reports `WarmStartExact` instead of `ZeroRhs`.
 - **BREAKING:** The serialized `Preconditioner` wire format changed (v12 → v13) with the `approx-chol` 0.4 → 0.5 bump; 0.3.0 bytes no longer decode.
+- **BREAKING:** `Solver::solve` and `Solver::solve_batch` return `WithinError` (was `SolveError`), so a deferred preconditioner build surfaces its failure through the solve path (#260).
 
 ### Added
 
+- `PreconditionerConfig::Adaptive` starts on the diagonal and escalates to additive Schwarz on a stalled contraction, building the Schwarz factorization only on escalation; `Solver::has_escalated()` reports whether a handoff occurred (#260).
 - `schwarz_precond::EscalationPolicy` builds a per-run `EscalationHandler` that ends a solve with `LsmrStopReason::Escalated` and an iterate that warm-starts the next preconditioner; `Staleness` implements it from the trailing contraction window.
+- `schwarz_precond::Staleness` gains `Default` (window 4, threshold 0.7) and `window()`/`threshold()` accessors (#260).
 - `schwarz_precond::MlsmrOptions::warm_start` carries an initial iterate through a change of preconditioner.
 
 ### Fixed

@@ -126,6 +126,26 @@ impl Staleness {
         }
         Ok(Self { window, threshold })
     }
+
+    /// Consecutive stalled iterations required before escalating.
+    pub fn window(&self) -> usize {
+        self.window
+    }
+
+    /// Contraction ratio above which an iteration counts as stalled.
+    pub fn threshold(&self) -> f64 {
+        self.threshold
+    }
+}
+
+impl Default for Staleness {
+    /// Four contractions above 0.7 (< 30% residual reduction each) signal a stalled solve.
+    fn default() -> Self {
+        Self {
+            window: 4,
+            threshold: 0.7,
+        }
+    }
 }
 
 impl EscalationPolicy for Staleness {
