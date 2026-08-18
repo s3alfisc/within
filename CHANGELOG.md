@@ -17,6 +17,7 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `BuildWarning::CollinearSlopeCovariate` reports a slope covariate that is (nearly) a per-level combination of another term's columns — a cross-term near-null direction that per-term whitening cannot see and that can inflate iteration counts by orders of magnitude (#281).
 - `schwarz_precond::EscalationPolicy` builds a per-run `EscalationHandler` that ends a solve with `LsmrStopReason::Escalated` and an iterate that warm-starts the next preconditioner; `Staleness` implements it from the trailing contraction window.
 - `schwarz_precond::MlsmrOptions::warm_start` carries an initial iterate through a change of preconditioner.
 
