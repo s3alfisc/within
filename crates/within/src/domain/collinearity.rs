@@ -17,46 +17,54 @@ pub(crate) fn detect_collinear_slopes(
     design: &Design<'_>,
     weights: Option<&[f64]>,
 ) -> Vec<BuildWarning> {
-    let mut pairs: Vec<(Channel, u32, usize)> = Vec::new();
-    for term in 0..design.n_factors() {
-        for slope in design.channels(term) {
-            let Loading::Covariate(column) = design.loading(slope) else {
-                continue;
-            };
-            pairs.extend(
-                (0..design.n_factors())
-                    .filter(|&t| t != term)
-                    .map(|t| (slope, column, t)),
-            );
-        }
-    }
-    pairs
-        .par_iter()
-        .filter_map(|&(slope, covariate, term)| {
-            let relative_residual = relative_residual(design, weights, covariate, term);
-            (relative_residual <= COLLINEARITY_TOL).then_some(
-                BuildWarning::CollinearSlopeCovariate {
-                    slope,
-                    term,
-                    relative_residual,
-                },
-            )
+    // Grouped by the reproducing term: its per-level Gram is shared by every candidate.
+    (0..design.n_factors())
+        .into_par_iter()
+        .flat_map_iter(|term| {
+            let candidates: Vec<(Channel, u32)> = (0..design.n_factors())
+                .filter(|&t| t != term)
+                .flat_map(|t| design.channels(t))
+                .filter_map(|slope| match design.loading(slope) {
+                    Loading::Covariate(column) => Some((slope, column)),
+                    Loading::Constant => None,
+                })
+                .collect();
+            let residuals = relative_residuals(design, weights, &candidates, term);
+            candidates
+                .into_iter()
+                .zip(residuals)
+                .filter_map(move |((slope, _), relative_residual)| {
+                    (relative_residual <= COLLINEARITY_TOL).then_some(
+                        BuildWarning::CollinearSlopeCovariate {
+                            slope,
+                            term,
+                            relative_residual,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
         })
         .collect()
 }
 
-/// Share of the covariate's (weighted) sum of squares outside `term`'s column span.
-fn relative_residual(
+/// Share of each candidate covariate's (weighted) sum of squares outside `term`'s column span.
+fn relative_residuals(
     design: &Design<'_>,
     weights: Option<&[f64]>,
-    covariate: u32,
+    candidates: &[(Channel, u32)],
     term: usize,
-) -> f64 {
-    let target = design.frame.loading_column(covariate as usize);
+) -> Vec<f64> {
+    let s = candidates.len();
+    if s == 0 {
+        return Vec::new();
+    }
+    let targets: Vec<&[f64]> = candidates
+        .iter()
+        .map(|&(_, column)| design.frame.loading_column(column as usize))
+        .collect();
     let levels = design.frame.level_column(term);
     let columns = &design.terms[term].columns;
     let p = columns.len();
-    let stride = p * p + p;
 
     let covariate_slots: Vec<(usize, &[f64])> = columns
         .iter()
@@ -67,45 +75,64 @@ fn relative_residual(
         })
         .collect();
 
-    let mut per_level = vec![0.0f64; design.terms[term].n_levels * stride];
-    let mut ss_total = 0.0;
+    let mut per_level_gram = vec![0.0f64; design.terms[term].n_levels * p * p];
+    let mut per_level_cross = vec![0.0f64; design.terms[term].n_levels * s * p];
+    let mut ss_total = vec![0.0f64; s];
     let mut x = vec![1.0f64; p];
-    for (obs, (&value, &level)) in target.iter().zip(levels).enumerate() {
+    for (obs, &level) in levels.iter().enumerate() {
         let w = weights.map_or(1.0, |w| w[obs]);
-        ss_total += w * value * value;
         for &(slot, loadings) in &covariate_slots {
             x[slot] = loadings[obs];
         }
-        let (gram, cross) =
-            per_level[level as usize * stride..(level as usize + 1) * stride].split_at_mut(p * p);
+        let gram = &mut per_level_gram[level as usize * p * p..][..p * p];
         for q in 0..p {
             let wx = w * x[q];
-            cross[q] += wx * value;
             for r in 0..p {
                 gram[q * p + r] += wx * x[r];
             }
         }
-    }
-    if ss_total <= 0.0 {
-        return 1.0;
+        let cross = &mut per_level_cross[level as usize * s * p..][..s * p];
+        for (j, target) in targets.iter().enumerate() {
+            let value = target[obs];
+            ss_total[j] += w * value * value;
+            for q in 0..p {
+                cross[j * p + q] += w * x[q] * value;
+            }
+        }
     }
 
-    let mut ss_projected = 0.0;
+    let mut ss_projected = vec![0.0f64; s];
     let mut active = Vec::with_capacity(p);
-    for level in per_level.chunks_exact_mut(stride) {
-        let (gram, cross) = level.split_at_mut(p * p);
-        ss_projected += projected_ss(gram, cross, &mut active);
+    for (gram, crosses) in per_level_gram
+        .chunks_exact_mut(p * p)
+        .zip(per_level_cross.chunks_exact_mut(s * p))
+    {
+        projected_ss(gram, crosses, p, &mut ss_projected, &mut active);
     }
-    ((ss_total - ss_projected) / ss_total).max(0.0)
+    ss_total
+        .iter()
+        .zip(&ss_projected)
+        .map(|(&total, &projected)| {
+            if total <= 0.0 {
+                1.0
+            } else {
+                ((total - projected) / total).max(0.0)
+            }
+        })
+        .collect()
 }
 
-/// `cᵀ G⁺ c` for one level's tiny PSD Gram, by pivoted outer-product Cholesky.
-fn projected_ss(gram: &mut [f64], cross: &mut [f64], active: &mut Vec<usize>) -> f64 {
-    let p = cross.len();
+/// Adds `cᵀ G⁺ c` per cross vector to `ss`, by pivoted outer-product Cholesky of one level's Gram.
+fn projected_ss(
+    gram: &mut [f64],
+    crosses: &mut [f64],
+    p: usize,
+    ss: &mut [f64],
+    active: &mut Vec<usize>,
+) {
     let floor = PIVOT_FLOOR * (0..p).map(|q| gram[q * p + q]).fold(0.0f64, f64::max);
     active.clear();
     active.extend(0..p);
-    let mut ss = 0.0;
     while let Some((position, &pivot)) = active
         .iter()
         .enumerate()
@@ -116,16 +143,19 @@ fn projected_ss(gram: &mut [f64], cross: &mut [f64], active: &mut Vec<usize>) ->
             break;
         }
         active.swap_remove(position);
-        ss += cross[pivot] * cross[pivot] / diagonal;
+        for (contribution, cross) in ss.iter_mut().zip(crosses.chunks_exact(p)) {
+            *contribution += cross[pivot] * cross[pivot] / diagonal;
+        }
         for &row in active.iter() {
             let multiplier = gram[row * p + pivot] / diagonal;
-            cross[row] -= multiplier * cross[pivot];
+            for cross in crosses.chunks_exact_mut(p) {
+                cross[row] -= multiplier * cross[pivot];
+            }
             for &col in active.iter() {
                 gram[row * p + col] -= multiplier * gram[pivot * p + col];
             }
         }
     }
-    ss
 }
 
 #[cfg(test)]
@@ -149,17 +179,7 @@ mod tests {
         (a, b)
     }
 
-    fn pseudo_noise(n: usize, seed: u64) -> Vec<f64> {
-        let mut state = seed;
-        (0..n)
-            .map(|_| {
-                state = state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                (state >> 11) as f64 / (1u64 << 53) as f64 - 0.5
-            })
-            .collect()
-    }
+    use crate::test_rng::pseudo_noise;
 
     #[test]
     fn shared_covariate_across_two_terms_warns_both_ways() {
