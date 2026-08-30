@@ -23,10 +23,12 @@ from ._framework import (
 from .suites import (  # noqa: F401
     ac_comparison,
     akm_panel,
+    akm_slopes,
     fixest_comparison,
     high_fe,
     many_components,
     scaling,
+    slopes,
     subdomain_regimes,
     verify,
 )

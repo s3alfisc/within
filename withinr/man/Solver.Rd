@@ -4,12 +4,11 @@
 \alias{Solver}
 \title{Persistent fixed-effects solver}
 \usage{
-Solver(categories, weights = NULL, preconditioner = NULL)
+Solver(design, weights = NULL, preconditioner = NULL)
 }
 \arguments{
-\item{categories}{Integer matrix of shape \verb{(n_obs, n_factors)}. Each column
-contains \strong{1-based} factor level assignments. Values must be positive
-integers with no \code{NA}s.}
+\item{design}{Either an integer category matrix of shape
+\verb{(n_obs, n_factors)} with 1-based labels, or a list of \code{\link[=Effect]{Effect()}} terms.}
 
 \item{weights}{Numeric vector of length \code{n_obs} or \code{NULL}.}
 

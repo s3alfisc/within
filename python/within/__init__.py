@@ -37,19 +37,26 @@ Two-tier public API:
   (``solve``, ``Solver``, ``LsmrOptions``, ``PreconditionerConfig``,
   ``Preconditioner``).
 - :mod:`within.config` re-exports the advanced configuration objects
-  (``AdditiveSchwarz``, ``LocalSolverConfig``, ``ApproxCholConfig``,
-  ``ApproxSchurConfig``, ``ReductionStrategy``).
+  (``LocalSolverConfig``, ``ApproxCholConfig``, ``ApproxSchurConfig``,
+  ``ReductionStrategy``, ``ScalingConfig``, ``Schur``).
+
+Thread safety: the heavy work runs with the interpreter detached and reads the
+caller's arrays in place. As with NumPy itself, an input array must not be
+mutated from another thread while a ``within`` call is reading it.
 
 For Rust-level internals, build the API docs with ``cargo doc --open``.
 """
 
 from within._within import (
     BatchSolveResult,
+    CoefficientLayout,
+    Effect,
     LsmrOptions,
     Preconditioner,
     PreconditionerConfig,
     SolveResult,
     Solver,
+    UnidentifiedDirection,
     solve,
     solve_batch,
 )
@@ -57,11 +64,14 @@ from within import config  # noqa: F401 — expose submodule on `within.config`
 
 __all__ = [
     "BatchSolveResult",
+    "CoefficientLayout",
+    "Effect",
     "LsmrOptions",
     "Preconditioner",
     "PreconditionerConfig",
     "SolveResult",
     "Solver",
+    "UnidentifiedDirection",
     "solve",
     "solve_batch",
     "config",

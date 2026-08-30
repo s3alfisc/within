@@ -82,7 +82,7 @@ benchmark_withinr_vs_fixest_difficult <- function(
     for (r in seq_len(reps)) {
       t_within[r] <- system.time({
         wr <- withinr::within_solve_batch(
-          categories = cats,
+          design = cats,
           Y = Y,
           options = options,
           preconditioner = preconditioner

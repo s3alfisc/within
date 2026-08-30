@@ -7,17 +7,83 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING:** Python `PreconditionerConfig` is now a tagged union: construct variants as `PreconditionerConfig.Off()`, `.Diagonal()`, or `.Additive(local_solver=..., reduction=...)` (previously class-attribute singletons plus an `.additive()` factory). Instances compare by value and support `match`/`case` on Python ≥3.10.
+- Rust `Preconditioner` objects expose their normalized construction configuration through `Preconditioner::config()`.
+- Serialized `schwarz_precond::SchwarzPreconditioner` values now preserve the configured reduction strategy.
+- **BREAKING:** `schwarz_precond::mlsmr` takes an `MlsmrOptions` in place of its trailing `local_size`.
+- **BREAKING:** `LsmrStopReason` gains `Escalated` and `WarmStartExact`, breaking exhaustive `match`es.
+- A warm start that already solves the system reports `WarmStartExact` instead of `ZeroRhs`.
+- **BREAKING:** `ScalingConfig::max_sweeps` is now `max_iterations`, and `BuildWarning::UnscalableComponent` reports `iterations` in place of `sweeps`; the dominance certificate runs reduced CG, not relaxation sweeps.
+- **BREAKING:** The serialized `Preconditioner` wire format changed with the `approx-chol` 0.4 → 0.5 bump (v12 → v13), retention of the complete construction config (v13 → v14), retention of its original build duration (v14 → v15), and the new `LocalSolverConfig::ridge` field (v15 → v16); 0.3.0 bytes no longer decode.
+- `withinr` development builds patch `within` to the workspace crate, while offline builds patch it to vendored local crate sources.
+
 ### Added
 
-- **Locality sort:** `Design` construction reorders observations by the highest-cardinality factor when unsorted, copying them once into an internal sorted store (the caller's store is never mutated; the `Store` trait stays read-only). Transparent — results return in caller row order.
-- Coalesced scatter for large sorted factors: one atomic add per equal-level run per chunk instead of one per row.
-- `withinr` preconditioner handles now expose `variant` and `build_time_seconds` metadata for cache compatibility checks and diagnostics.
-- `withinr` manual tests now cover diagonal/additive/off correctness parity, prebuilt preconditioner reuse, and sorted-vs-unsorted caller-order equivalence.
+- Python `Preconditioner.build_duration_seconds` and Rust `Preconditioner::build_duration()` expose the original preconditioner build duration, preserved across serialization and reuse.
+- `BuildWarning::CollinearSlopeCovariate` reports a slope covariate that is (nearly) a per-level combination of another term's columns — a cross-term near-null direction that per-term whitening cannot see and that can inflate iteration counts by orders of magnitude (#281).
+- `schwarz_precond::EscalationPolicy` builds a per-run `EscalationHandler` that ends a solve with `LsmrStopReason::Escalated` and an iterate that warm-starts the next preconditioner; `Staleness` implements it from the trailing contraction window.
+- `schwarz_precond::MlsmrOptions::warm_start` carries an initial iterate through a change of preconditioner.
+- `LocalSolverConfig::ridge` (Python `LocalSolverConfig(ridge=...)`) floors the local spectrum of grounded slope-pair components at a fraction of their largest diagonal; `0` disables it (#290).
+- `withinr` adds R bindings for one-shot and persistent solves, preconditioner reuse, advanced local-solver configuration, and current solve-result metadata.
+
+### Fixed
+
+- A design carrying varying slopes on two distinct factors could fail preconditioner construction with `matrix is not symmetric`, when rounding left the two triangles of the exact Schur complement unequal (#229).
+- A `design` that is neither a 2-D `uint32` array nor a list of `Effect` raised `ValueError` where the documented type is `TypeError`, and `AdditiveSchwarz` accepted a wrong-type `local_solver` at construction, deferring the `TypeError` to solve time (#248).
+- A slope covariate collinear with another term could make LSMR report convergence on a solve that had not demeaned the response; tolerance stops are now audited against the true residual and a failed check reports `LsmrStopReason::FalseConvergence` with `converged = false` (#290).
+
+### Removed
+
+- `faer` is no longer a dependency of `schwarz-precond`; it is used only by the `custom_local_solver` example and moves to dev-dependencies.
+
+## [0.3.0] - 2026-07-30
+
+### Added
+
+- **Varying slopes:** the `Effect` term type (level codes, an intercept flag, zero or more slope columns) is accepted anywhere a categories matrix is, in Rust and Python (#58–#63).
+- `SolveResult` / `BatchSolveResult` report unidentified directions in `unidentified` — Rust `CoefficientAddress`, Python `UnidentifiedDirection`; those coefficient slots hold `0`, never NaN (#69).
+- `layout` (`CoefficientLayout`) converts between a coefficient address and its flat `x` index (#99).
+- `SolveResult.x` is term-major: coefficient column `c` of `level` sits at `term_offset + c * n_levels + level`. Intercept-only designs keep the 0.2.0 ordering (#71).
+- `BatchSolveResult.time_setup` reports the shared per-batch setup time (#194).
+- `ScalingConfig` tunes signed-component scaling certification; `Solver::warnings()` returns non-fatal `BuildWarning`s (#61).
+- `BuildError::{EmptyEffect, SlopeLengthMismatch, InvalidLoading, UnscalableComponent, DofSpaceExceedsU32}` (#58, #125, #160).
+- A `py.typed` marker, so type checkers pick up the shipped stubs (#142).
 
 ### Changed
 
-- Category views are borrowed only when the dominant factor is already sorted; otherwise the columns are copied once for the locality sort. The reorder changes summation order, so unsorted-input results match 0.2.0 within solver tolerance, not bitwise.
-- `withinr` development builds patch `within` to the workspace crate, while offline builds patch it to the vendored local crate sources.
+- **BREAKING:** The Python `solve` / `solve_batch` / `Solver` first parameter is renamed `categories` → `design` (#58).
+- **BREAKING:** The Python free `solve` / `solve_batch` take `(design, y, weights, options, preconditioner)`; `options` must now be passed by keyword (#101).
+- **BREAKING:** The serialized `Preconditioner` wire format changed (v3 → v12); 0.2.0 bytes no longer decode (#72, #98).
+- **BREAKING:** `LocalSolverConfig.approx_schur` becomes `schur: SchurMode` (Rust) / `Schur | None` (Python), where `None` means the default (approximate) and exact is `SchurMode::Exact` / `Schur.exact()`. The `within.config.LocalSolverConfig` compatibility subclass is removed, so `LocalSolverConfig` is no longer picklable (#104).
+- **BREAKING:** `SolveResult` / `BatchSolveResult` gain `unidentified` and `layout`, breaking struct literals and exhaustive destructuring (#69, #99).
+- **BREAKING:** `Design<'a>` / `Solver<'a>` take a lifetime instead of a storage type parameter, borrowing caller columns until a locality sort or `into_owned()` (#68).
+- **BREAKING:** `Design::from_store` → `Design::from_frame`, taking an `ObservationFrame` — columnar storage with each column independently borrowed or owned (#68).
+- **BREAKING:** `BuildError::ObservationCountMismatch` renames `factor` → `column`; `SingularDiagonal` drops `block` (#68).
+- **BREAKING:** `ndarray` 0.16 → 0.17, which appears in the public API as `IntoDesign for ArrayView2<u32>`.
+- **BREAKING:** The minimum supported Rust version is 1.85 (#123).
+- Python wheels are stable-ABI: one `cp39-abi3` wheel per platform runs on any CPython ≥ 3.9 (#161).
+- `approx-chol` 0.2.0 → 0.4.0, speeding up local-solver setup.
+- `Design` locality-sorts unsorted observations; results return in caller row order (#68). Together with the new `approx-chol` sampler, this makes coefficients agree with 0.2.0 within solver tolerance rather than bitwise.
+- `SolveResult.residual` reports the LSMR recurrence's normal-equation residual estimate instead of recomputing it exactly (#149).
+- Rust solve entry points take LSMR options as `impl Into<Option<&LsmrOptions>>`, so `None` selects the default (#105).
+- Python raises `RuntimeError` for runtime failures and reserves `ValueError` for invalid input (#179, #180), and `TypeError` naming the expected dtype for wrong-dtype arrays (#100).
+- The one-shot Python `solve` / `solve_batch` re-emit build warnings as `UserWarning`s, matching the persistent `Solver` (#103).
+
+### Fixed
+
+- A response with entries above ~1e154 overflowed the LSMR initial norm, silently returning `x = 0` as converged (#164).
+- A near-breakdown solve was aborted as a non-positive-definite preconditioner when the M-norm rounded slightly negative (#118).
+- Deserializing untrusted `Preconditioner` bytes could panic or scatter out of bounds; the invariants are now validated (#155, #166).
+- Python `Preconditioner.apply` releases the GIL around the native apply (#180).
+- Python `solve_batch` emitted the F-contiguity `UserWarning` twice.
+
+### Removed
+
+- `scipy` is no longer a runtime dependency of `within-py` — the package never imported it.
+- **BREAKING:** The `Store` trait and its `ArrayStore` / `FactorMajorStore` backends, superseded by `ObservationFrame` (#68).
+- **BREAKING:** `schwarz_precond::LsmrStopReason::BidiagonalizationBreakdown`; the tolerance test now fires on the same step.
 
 ## [0.2.0] - 2026-06-04
 

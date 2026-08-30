@@ -5,10 +5,13 @@ pub(crate) const PAR_SPMV_THRESHOLD: usize = 10_000;
 /// Target number of non-zeros per parallel chunk.
 const TARGET_NNZ_PER_CHUNK: usize = 32_768;
 
-/// Rectangular CSR matrix used as the off-diagonal block in bipartite Gramians.
-///
-/// Stores C (n_q × n_r) or C^T (n_r × n_q). All column indices within each
-/// row are sorted in ascending order.
+/// Checked `usize -> u32`: a silent `as` truncation would corrupt the structure undiagnosed.
+#[inline]
+pub(crate) fn to_u32(x: usize) -> u32 {
+    u32::try_from(x).expect("CSR index exceeds u32::MAX")
+}
+
+/// Rectangular CSR block storing `C` or `Cᵀ`, column indices ascending within each row.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CsrBlock {
     pub(crate) indptr: Vec<u32>,
@@ -24,10 +27,35 @@ impl CsrBlock {
         self.data.len()
     }
 
-    /// Transpose this CSR block: (nrows × ncols) → (ncols × nrows).
-    ///
-    /// O(nnz). Rows of the output are automatically sorted because we process
-    /// source rows in ascending order.
+    /// `nrows`/`ncols` sit beside the arrays, so untrusted bytes can make them disagree.
+    pub(crate) fn is_structurally_valid(&self) -> bool {
+        if self.nrows.checked_add(1) != Some(self.indptr.len()) {
+            return false;
+        }
+        let nnz = self.indices.len();
+        if self.data.len() != nnz {
+            return false;
+        }
+        if self.indptr[0] != 0 || *self.indptr.last().unwrap() as usize != nnz {
+            return false;
+        }
+        if self.indptr.windows(2).any(|w| w[0] > w[1]) {
+            return false;
+        }
+        self.indices.iter().all(|&j| (j as usize) < self.ncols)
+    }
+
+    /// Row `i` as `(column, weight)` pairs.
+    pub(crate) fn row(&self, i: usize) -> impl Iterator<Item = (usize, f64)> + '_ {
+        let start = self.indptr[i] as usize;
+        let end = self.indptr[i + 1] as usize;
+        self.indices[start..end]
+            .iter()
+            .zip(&self.data[start..end])
+            .map(|(&j, &w)| (j as usize, w))
+    }
+
+    /// Transpose in O(nnz); output rows come out sorted because source rows go ascending.
     pub(crate) fn transpose(&self) -> CsrBlock {
         let nnz = self.nnz();
         let mut row_counts = vec![0u32; self.ncols];
@@ -61,9 +89,7 @@ impl CsrBlock {
         }
     }
 
-    /// Build a CSR block from a row-major dense table, skipping zeros.
-    ///
-    /// `table` has layout `table[i * ncols + j]` for row i, column j.
+    /// Build a CSR block from a row-major dense table (`table[i * ncols + j]`), skipping zeros.
     pub(crate) fn from_dense_table(table: &[f64], nrows: usize, ncols: usize) -> Self {
         debug_assert_eq!(table.len(), nrows * ncols);
         let mut indptr = vec![0u32; nrows + 1];
@@ -99,10 +125,7 @@ impl CsrBlock {
         }
     }
 
-    /// y = base + A * x (sparse matrix-vector multiply with explicit base).
-    ///
-    /// This fuses a `copy_from_slice(base)` with sparse accumulation to avoid an
-    /// extra pass over the output buffer in block-elimination solves.
+    /// `y = base + A x`, fusing the base copy with accumulation to avoid an extra pass.
     pub(crate) fn spmv_assign_add(
         &self,
         x: &[f64],
@@ -169,10 +192,6 @@ mod tests {
     use super::*;
 
     fn make_3x4_block() -> CsrBlock {
-        // 3x4 matrix:
-        // [1.0  0.0  2.0  0.0]
-        // [0.0  3.0  0.0  4.0]
-        // [5.0  0.0  6.0  0.0]
         CsrBlock::from_dense_table(
             &[1.0, 0.0, 2.0, 0.0, 0.0, 3.0, 0.0, 4.0, 5.0, 0.0, 6.0, 0.0],
             3,
@@ -228,10 +247,7 @@ mod tests {
         assert_eq!(bt.ncols, 3);
         assert_eq!(bt.nnz(), 6);
 
-        // Verify A^T[j, i] == A[i, j] by checking specific values
-        // Original row 0: (0,0)=1, (0,2)=2
-        // Transposed: row 0 should have (0,0)=1, (0,2)=5
-        // row 2 should have (2,0)=2, (2,2)=6
+        // A^T[j, i] == A[i, j] on the values, not just the structure.
 
         // Row 0 of transpose: columns 0 and 2 (from original rows 0 and 2 having col 0)
         let r0_start = bt.indptr[0] as usize;
@@ -310,5 +326,43 @@ mod tests {
         assert_eq!(bt.nrows, 3);
         assert_eq!(bt.ncols, 2);
         assert_eq!(bt.nnz(), 0);
+    }
+
+    // Chunk *sizing* cannot change the result, so it is deliberately not asserted.
+    #[test]
+    fn par_spmv_matches_seq_above_threshold() {
+        let nrows = PAR_SPMV_THRESHOLD + 2_000;
+        let ncols = 64;
+        let half = ncols / 2;
+
+        // Values vary with the row, so a misindexed row is observable.
+        let mut indptr = vec![0u32; nrows + 1];
+        let mut indices = Vec::with_capacity(2 * nrows);
+        let mut data = Vec::with_capacity(2 * nrows);
+        for i in 0..nrows {
+            indices.push((i % half) as u32);
+            data.push(i as f64 * 0.5 + 1.0);
+            indices.push((half + i % half) as u32);
+            data.push(i as f64 * -0.25 - 2.0);
+            indptr[i + 1] = indptr[i] + 2;
+        }
+        let block = CsrBlock {
+            indptr,
+            indices,
+            data,
+            nrows,
+            ncols,
+        };
+
+        let x: Vec<f64> = (0..ncols).map(|j| (j as f64).sin()).collect();
+        let base: Vec<f64> = (0..nrows).map(|i| i as f64 * 1e-3).collect();
+
+        let mut y_par = vec![0.0; nrows];
+        block.par_spmv_assign_add(&x, &base, &mut y_par);
+
+        let mut y_seq = vec![0.0; nrows];
+        block.seq_spmv_assign_add(&x, &base, &mut y_seq);
+
+        assert_eq!(y_par, y_seq);
     }
 }

@@ -11,7 +11,8 @@ Preconditioner(data)
 }
 \value{
 A \code{within_preconditioner} object with \verb{$apply()} and \verb{$serialize()}
-methods and \verb{$nrows} and \verb{$ncols} fields.
+methods and \verb{$nrows}, \verb{$ncols}, \verb{$config}, and
+\verb{$build_duration_seconds} fields.
 }
 \description{
 Deserializes a preconditioner from raw bytes produced by

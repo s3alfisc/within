@@ -21,11 +21,11 @@ from typing import Any, Callable, Literal, TypeVar
 import numpy as np
 from numpy.typing import NDArray
 
-from within import LsmrOptions, solve
+from within import Effect, LsmrOptions, PreconditionerConfig, solve
 from within._within import (
-    AdditiveSchwarz,
     ApproxCholConfig,
     ApproxSchurConfig,
+    Schur,
     ReductionStrategy,
     LocalSolverConfig,
 )
@@ -76,6 +76,17 @@ class BenchmarkResult:
     passed: bool | None = None  # For correctness suites
 
 
+@dataclass(frozen=True)
+class SlopeCase:
+    """A varying-slopes benchmark problem: the ``Effect`` design to solve, the response,
+    and the bare factor codes the group-mean demean check needs."""
+
+    effects: list[Effect]
+    y: NDArray[np.float64]
+    categories: list[NDArray[np.uint32]]
+    n_levels: list[int]
+
+
 def max_abs_group_mean(
     categories: list[NDArray[np.int64]],
     n_levels: list[int],
@@ -107,7 +118,7 @@ def _solve_once(
     result = solve(
         np.asfortranarray(np.column_stack(categories).astype(np.uint32)),
         y,
-        config.config,
+        options=config.config,
         preconditioner=config.preconditioner,
     )
 
@@ -186,9 +197,13 @@ def benchmark_lsmr(
     )
 
 
-def make_additive_schwarz(local_solver: Any) -> AdditiveSchwarz:
+def make_additive_schwarz(
+    local_solver: LocalSolverConfig,
+) -> PreconditionerConfig.Additive:
     """Construct additive Schwarz using the default Auto reduction mode."""
-    return AdditiveSchwarz(local_solver=local_solver, reduction=ReductionStrategy.Auto)
+    return PreconditionerConfig.Additive(
+        local_solver=local_solver, reduction=ReductionStrategy.Auto
+    )
 
 
 def standard_solver_configs(
@@ -202,13 +217,13 @@ def standard_solver_configs(
     """
     schur = LocalSolverConfig(
         approx_chol=ApproxCholConfig(seed=opts.seed),
-        approx_schur=ApproxSchurConfig(seed=opts.seed),
+        schur=Schur.approximate(ApproxSchurConfig(seed=opts.seed)),
     )
     # "2-2": both densification knobs on — split_merge=2 (AC2 reduced-system
     # factorization) and split=2 (denser Schur clique-tree sampling).
     schur_2_2 = LocalSolverConfig(
         approx_chol=ApproxCholConfig(seed=opts.seed, split_merge=2),
-        approx_schur=ApproxSchurConfig(seed=opts.seed, split=2),
+        schur=Schur.approximate(ApproxSchurConfig(seed=opts.seed, split=2)),
     )
     return [
         SolverConfig(

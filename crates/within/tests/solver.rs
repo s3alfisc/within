@@ -1,5 +1,9 @@
 use ndarray::array;
-use within::{solve, LsmrOptions, Preconditioner, PreconditionerConfig, Solver};
+use within::{
+    solve, ApproxCholConfig, ApproxSchurConfig, Effect, LocalSolverConfig, LsmrOptions,
+    Preconditioner, PreconditionerConfig, ReductionStrategy, ScalingConfig, ScalingFailure,
+    SchurMode, Solver,
+};
 
 #[path = "common/orchestrate_helpers.rs"]
 mod common;
@@ -95,6 +99,7 @@ fn test_diagonal_preconditioner_single_factor_is_cached() {
         .expect("single-factor diagonal preconditioner should be cached");
     assert_eq!(cached.nrows(), 3);
     assert_eq!(cached.ncols(), 3);
+    assert_eq!(cached.config(), &precond);
 }
 
 #[test]
@@ -131,6 +136,61 @@ fn test_solver_batch() {
 
     assert_eq!(batch.converged.len(), 3);
     assert!(batch.converged.iter().all(|&c| c));
+
+    // The method reuses the already-built preconditioner, so it reports no
+    // build cost; the free solve_batch is what folds construction in.
+    assert_eq!(batch.time_setup, 0.0);
+}
+
+#[test]
+fn test_solver_batch_term_design_shares_drop_report() {
+    // Level 0's z is constant, so its whitened slope column drops; each batch
+    // column must reproduce the single solve and share the drop report.
+    let f = [0u32, 0, 0, 1, 1, 1];
+    let g = [0u32, 1, 2, 0, 1, 2];
+    let z = [3.0, 3.0, 3.0, -1.0, -1.0, 2.0];
+    let ys = [
+        [1.0, -2.0, 0.5, 3.0, -1.5, 2.5],
+        [0.3, 1.1, -0.7, 2.2, 0.9, -1.4],
+    ];
+    let effects = vec![
+        Effect::new(&f, true, [&z[..]]).expect("slope effect"),
+        Effect::new(&g, true, []).expect("plain effect"),
+    ];
+    let params = default_params();
+
+    let solver = Solver::new(effects, None, additive_precond()).expect("solver build");
+    let batch = solver
+        .solve_batch(&[&ys[0], &ys[1]], &params)
+        .expect("solve batch");
+    assert!(!batch.unidentified.is_empty(), "level 0 slope should drop");
+
+    for (i, y) in ys.iter().enumerate() {
+        let single = solver.solve(y, &params).expect("single solve");
+        assert_eq!(batch.unidentified, single.unidentified);
+        for (a, b) in batch.x(i).iter().zip(single.x.iter()) {
+            assert!((a - b).abs() < 1e-12, "batch x mismatch");
+        }
+        for (a, b) in batch.demeaned(i).iter().zip(single.demeaned.iter()) {
+            assert!((a - b).abs() < 1e-12, "batch demeaned mismatch");
+        }
+    }
+}
+
+#[test]
+fn test_unidentified_empty_for_plain_factors() {
+    let (categories, y) = categories_and_y();
+    let params = default_params();
+    let precond = additive_precond();
+
+    let solver = Solver::new(categories.view(), None, &precond).expect("solver build");
+
+    let single = solver.solve(&y, &params).expect("solve");
+    assert!(single.unidentified.is_empty());
+    assert!(single.x.iter().all(|v| v.is_finite()));
+
+    let batch = solver.solve_batch(&[&y], &params).expect("solve batch");
+    assert!(batch.unidentified.is_empty());
 }
 
 #[test]
@@ -144,10 +204,26 @@ fn test_solver_properties() {
 }
 
 #[test]
-fn test_serde_roundtrip() {
+fn test_additive_serde_roundtrip_preserves_config_and_solution() {
     let (categories, y) = categories_and_y();
     let params = default_params();
-    let precond = additive_precond();
+    let precond = PreconditionerConfig::Additive {
+        local_solver: LocalSolverConfig {
+            approx_chol: ApproxCholConfig {
+                seed: 41,
+                split_merge: Some(3),
+            },
+            schur: SchurMode::Approximate(ApproxSchurConfig { seed: 17, split: 2 }),
+            dense_threshold: 0,
+            scaling: ScalingConfig {
+                tolerance: 1e-7,
+                max_iterations: 123,
+                on_failure: ScalingFailure::Error,
+            },
+            ridge: 1e-5,
+        },
+        reduction: ReductionStrategy::AtomicScatter,
+    };
 
     let solver1 = Solver::new(categories.view(), None, &precond).expect("solver build");
     let r1 = solver1.solve(&y, &params).expect("solve 1");
@@ -156,13 +232,23 @@ fn test_serde_roundtrip() {
     let precond_ref = solver1
         .preconditioner()
         .expect("should have preconditioner");
+    assert_eq!(precond_ref.config(), &precond);
     let bytes = postcard::to_stdvec(precond_ref).expect("serialize");
     assert!(!bytes.is_empty());
 
     // Deserialize and build new solver
     let precond2: Preconditioner = postcard::from_bytes(&bytes).expect("deserialize");
+    assert_eq!(precond2.config(), &precond);
+    assert_eq!(precond2.build_duration(), precond_ref.build_duration());
     let solver2 =
         Solver::new(categories.view(), None, precond2).expect("solver from preconditioner");
+    assert_eq!(
+        solver2
+            .preconditioner()
+            .expect("reused preconditioner")
+            .build_duration(),
+        precond_ref.build_duration(),
+    );
     let r2 = solver2.solve(&y, &params).expect("solve 2");
 
     for (a, b) in r1.x.iter().zip(r2.x.iter()) {
@@ -184,6 +270,7 @@ fn test_diagonal_serde_roundtrip() {
     let deserialized: Preconditioner = postcard::from_bytes(&bytes).expect("deserialize");
     assert_eq!(deserialized.nrows(), precond_ref.nrows());
     assert_eq!(deserialized.ncols(), precond_ref.ncols());
+    assert_eq!(deserialized.build_duration(), precond_ref.build_duration());
 
     let x: Vec<f64> = (0..precond_ref.ncols()).map(|i| i as f64 + 0.25).collect();
     let mut y1 = vec![0.0; precond_ref.nrows()];
@@ -207,13 +294,13 @@ fn test_solver_accepts_prebuilt_design() {
 
 /// The construction-time locality sort must be transparent: coefficients are
 /// permutation-invariant and `demeaned` comes back in caller order. The sort
-/// is applied to every store by `Design::from_store`, so the oracle is built
-/// via `from_store_unsorted`, the explicit caller-order escape hatch. Results
+/// is applied to every frame by `Design::from_frame`, so the oracle is built
+/// via `from_frame_unsorted`, the explicit caller-order escape hatch. Results
 /// agree within solver tolerance, not bitwise: the paths sum in different
 /// row orders.
 #[test]
 fn test_internal_locality_sort_is_transparent() {
-    use within::observation::FactorMajorStore;
+    use within::observation::ObservationFrame;
     use within::Design;
 
     // Factor 0 (4 levels) is the dominant factor and is non-monotonic.
@@ -232,8 +319,10 @@ fn test_internal_locality_sort_is_transparent() {
         Solver::new(design, weights, &precond).expect("solver")
     };
     let make_oracle = |weights: Option<Vec<f64>>| {
-        let store = FactorMajorStore::new(vec![col0.clone(), col1.clone()], n_obs).expect("store");
-        let design = Design::from_store_unsorted(store).expect("oracle design");
+        let frame =
+            ObservationFrame::new(vec![col0.clone().into(), col1.clone().into()], Vec::new())
+                .expect("frame");
+        let design = Design::from_frame_unsorted(frame).expect("oracle design");
         Solver::new(design, weights, &precond).expect("oracle solver")
     };
 

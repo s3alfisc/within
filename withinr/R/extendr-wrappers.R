@@ -7,11 +7,11 @@
 #' @useDynLib withinr, .registration = TRUE
 NULL
 
-solve_impl <- function(categories, y, options, weights, preconditioner) .Call(wrap__solve_impl, categories, y, options, weights, preconditioner)
+solve_impl <- function(design, y, options, weights, preconditioner) .Call(wrap__solve_impl, design, y, options, weights, preconditioner)
 
-solve_batch_impl <- function(categories, y_matrix, options, weights, preconditioner) .Call(wrap__solve_batch_impl, categories, y_matrix, options, weights, preconditioner)
+solve_batch_impl <- function(design, y_matrix, options, weights, preconditioner) .Call(wrap__solve_batch_impl, design, y_matrix, options, weights, preconditioner)
 
-solver_new_impl <- function(categories, weights, preconditioner) .Call(wrap__solver_new_impl, categories, weights, preconditioner)
+solver_new_impl <- function(design, weights, preconditioner) .Call(wrap__solver_new_impl, design, weights, preconditioner)
 
 solver_solve_impl <- function(solver, y, options) .Call(wrap__solver_solve_impl, solver, y, options)
 
@@ -23,6 +23,18 @@ solver_n_dofs_impl <- function(solver) .Call(wrap__solver_n_dofs_impl, solver)
 
 solver_n_obs_impl <- function(solver) .Call(wrap__solver_n_obs_impl, solver)
 
+layout_n_dofs_impl <- function(layout) .Call(wrap__layout_n_dofs_impl, layout)
+
+layout_n_terms_impl <- function(layout) .Call(wrap__layout_n_terms_impl, layout)
+
+layout_n_levels_impl <- function(layout, term) .Call(wrap__layout_n_levels_impl, layout, term)
+
+layout_n_columns_impl <- function(layout, term) .Call(wrap__layout_n_columns_impl, layout, term)
+
+layout_index_impl <- function(layout, term, level, column) .Call(wrap__layout_index_impl, layout, term, level, column)
+
+layout_address_impl <- function(layout, index) .Call(wrap__layout_address_impl, layout, index)
+
 preconditioner_apply_impl <- function(preconditioner, x) .Call(wrap__preconditioner_apply_impl, preconditioner, x)
 
 preconditioner_nrows_impl <- function(preconditioner) .Call(wrap__preconditioner_nrows_impl, preconditioner)
@@ -31,8 +43,10 @@ preconditioner_ncols_impl <- function(preconditioner) .Call(wrap__preconditioner
 
 preconditioner_variant_impl <- function(preconditioner) .Call(wrap__preconditioner_variant_impl, preconditioner)
 
+preconditioner_config_impl <- function(preconditioner) .Call(wrap__preconditioner_config_impl, preconditioner)
+
+preconditioner_build_duration_impl <- function(preconditioner) .Call(wrap__preconditioner_build_duration_impl, preconditioner)
+
 preconditioner_serialize_impl <- function(preconditioner) .Call(wrap__preconditioner_serialize_impl, preconditioner)
 
 preconditioner_deserialize_impl <- function(data) .Call(wrap__preconditioner_deserialize_impl, data)
-
-

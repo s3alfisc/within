@@ -1,106 +1,123 @@
-//! Factor-pair subdomain construction.
+//! Channel-pair subdomain construction.
 //!
-//! Each factor pair `(q, r)` becomes a Schwarz subdomain (one per connected
-//! component of its bipartite cross-tab). Overlap is handled by partition-of-unity
-//! weights — see [`schwarz_precond::domain`] for the math.
+//! Each cross-factor channel pair becomes a Schwarz subdomain (one per
+//! connected component of its bipartite cross-tab). Overlap is handled by
+//! partition-of-unity weights — see [`schwarz_precond::domain`] for the math.
 //!
 //! Entry point: [`build_local_domains`].
 
 use schwarz_precond::{PartitionWeights, SubdomainCore};
 
+use crate::channel::{Channel, ChannelPair};
+use crate::config::LocalSolverConfig;
+use crate::{BuildError, BuildWarning};
+
 use super::{find_all_active_levels, BlockDiagonals, CrossTab, Design};
-use crate::observation::Store;
 
-/// A local subdomain corresponding to a pair of factors.
-#[derive(Clone)]
-pub(crate) struct Subdomain {
-    /// Generic subdomain core: global DOF indices, restriction, and partition-of-unity weights.
-    pub core: SubdomainCore,
+mod sddm;
+use crate::domain::Loading;
+use sddm::{convert, NotScalable};
+pub(crate) use sddm::{CoordinateMap, Grounding, LocalComponent, MatrixForm, SddmMatrix};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ComponentClass {
+    KnownLaplacian,
+    General,
 }
 
-impl std::fmt::Debug for Subdomain {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Subdomain")
-            .field("n_dofs", &self.core.n_local())
-            .finish()
-    }
-}
-
-/// A factor-pair subdomain paired with the CrossTab it was built from.
-///
-/// The CrossTab (and its build-time [`BlockDiagonals`]) travel with the
-/// subdomain so the local solver can be built without rebuilding the
-/// cross-tabulation.
+/// A factor-pair Schwarz domain paired with its validated local operator.
 #[derive(Clone)]
 pub(crate) struct LocalDomain {
-    pub(crate) subdomain: Subdomain,
-    pub(crate) cross_tab: CrossTab,
-    pub(crate) block_diagonals: BlockDiagonals,
+    pub(crate) core: SubdomainCore,
+    pub(crate) component: LocalComponent,
 }
 
-/// Build local subdomains (with pre-built CrossTabs) for pairs of factors.
-///
-/// For each factor pair, builds a fused CrossTab via a single observation scan,
-/// detects connected components on the bipartite structure, and creates one
-/// subdomain per component. The CrossTab travels with each subdomain to avoid
-/// a rebuild.
-///
-/// Factor pairs are processed in parallel via Rayon. The
-/// `compute_partition_weights` step remains sequential after the parallel
-/// collect.
-pub(crate) fn build_local_domains<S: Store>(
-    design: &Design<S>,
+/// Same-factor channel pairs are exactly orthogonal after whitening, so never enumerated.
+pub(crate) fn build_local_domains(
+    design: &Design<'_>,
     weights: Option<&[f64]>,
-) -> Vec<LocalDomain> {
+    config: &LocalSolverConfig,
+) -> Result<(Vec<LocalDomain>, Vec<BuildWarning>), BuildError> {
     use rayon::prelude::*;
 
-    let n_factors = design.n_factors();
-    let pairs: Vec<(usize, usize)> = (0..n_factors)
-        .flat_map(|q| ((q + 1)..n_factors).map(move |r| (q, r)))
+    if !config.ridge.is_finite() || config.ridge < 0.0 {
+        return Err(BuildError::InvalidRidge {
+            value: config.ridge,
+        });
+    }
+
+    let channels: Vec<Channel> = (0..design.n_factors())
+        .flat_map(|term| design.channels(term))
+        .collect();
+    let pairs: Vec<ChannelPair> = channels
+        .iter()
+        .enumerate()
+        .flat_map(|(i, &rows)| {
+            channels[i + 1..]
+                .iter()
+                .filter(move |cols| cols.term != rows.term)
+                .map(move |&cols| ChannelPair { rows, cols })
+        })
         .collect();
     let all_active = find_all_active_levels(design);
 
-    let mut domain_pairs: Vec<LocalDomain> = pairs
+    let per_pair: Vec<(Vec<LocalDomain>, Vec<BuildWarning>)> = pairs
         .par_iter()
-        .flat_map(|&(q, r)| {
-            let (full_ct, full_diag, l2g) =
-                match CrossTab::build_for_pair_with_active(design, weights, q, r, &all_active) {
-                    Some(triple) => triple,
-                    None => return Vec::new(),
-                };
-            let n_q_full = full_ct.n_q();
-            split_into_subdomains(full_ct, full_diag, &l2g, n_q_full)
+        .map(|&pair| {
+            let Some((full_ct, full_diag, l2g)) =
+                CrossTab::build_for_pair_with_active(design, weights, pair, &all_active)
+            else {
+                return Ok((Vec::new(), Vec::new()));
+            };
+            let class = if matches!(design.loading(pair.rows), Loading::Constant)
+                && matches!(design.loading(pair.cols), Loading::Constant)
+            {
+                ComponentClass::KnownLaplacian
+            } else {
+                ComponentClass::General
+            };
+            split_into_subdomains(pair, class, full_ct, full_diag, &l2g, config)
         })
-        .collect();
+        .collect::<Result<_, BuildError>>()?;
+    let mut domain_pairs = Vec::new();
+    let mut warnings = Vec::new();
+    for (domains, pair_warnings) in per_pair {
+        domain_pairs.extend(domains);
+        warnings.extend(pair_warnings);
+    }
 
-    compute_partition_weights(&mut domain_pairs, design.n_dofs);
+    // A slope channel breaks `1/√c`'s equal-informativeness assumption (#94), so stay uniform.
+    if !channels
+        .iter()
+        .any(|&c| design.loading(c).covariate().is_some())
+    {
+        compute_partition_weights(&mut domain_pairs, design.n_dofs);
+    }
 
-    domain_pairs
+    Ok((domain_pairs, warnings))
 }
 
-/// Split a full CrossTab into per-component subdomains.
-///
-/// Finds bipartite connected components, extracts a sub-CrossTab and its sliced
-/// [`BlockDiagonals`] for each, and builds a `Subdomain` with uniform
-/// partition-of-unity weights.
+/// Dead singletons (zero diagonal, an exact-zero design column) produce no subdomain.
 fn split_into_subdomains(
+    pair: ChannelPair,
+    class: ComponentClass,
     full_ct: CrossTab,
     full_diag: BlockDiagonals,
     l2g: &[u32],
-    n_q_full: usize,
-) -> Vec<LocalDomain> {
+    config: &LocalSolverConfig,
+) -> Result<(Vec<LocalDomain>, Vec<BuildWarning>), BuildError> {
+    let n_rows_full = full_ct.n_rows();
     let components = full_ct.bipartite_connected_components();
 
-    let (cross_tabs, diagonals): (Vec<CrossTab>, Vec<BlockDiagonals>) = if components.len() == 1 {
-        (vec![full_ct], vec![full_diag])
+    let (cross_tabs, diagonals): (Vec<CrossTab>, Vec<Vec<f64>>) = if components.len() == 1 {
+        let flat = full_diag.rows.into_iter().chain(full_diag.cols).collect();
+        (vec![full_ct], vec![flat])
     } else {
-        // One reusable remap buffer pair for the whole parent; `extract_component`
-        // resets it per component, avoiding a fresh parent-sized allocation each.
-        let mut q_remap = vec![u32::MAX; full_ct.n_q()];
-        let mut r_remap = vec![u32::MAX; full_ct.n_r()];
+        let mut row_remap = vec![u32::MAX; full_ct.n_rows()];
+        let mut col_remap = vec![u32::MAX; full_ct.n_cols()];
         let cross_tabs = components
             .iter()
-            .map(|comp| full_ct.extract_component(comp, &mut q_remap, &mut r_remap))
+            .map(|comp| full_ct.extract_component(comp, &mut row_remap, &mut col_remap))
             .collect();
         let diagonals = components
             .iter()
@@ -109,65 +126,66 @@ fn split_into_subdomains(
         (cross_tabs, diagonals)
     };
 
-    components
-        .iter()
-        .zip(cross_tabs)
-        .zip(diagonals)
-        .map(|((comp, comp_ct), comp_diag)| {
-            let comp_l2g: Vec<u32> = comp
-                .q_indices
-                .iter()
-                .map(|&i| l2g[i])
-                .chain(comp.r_indices.iter().map(|&i| l2g[n_q_full + i]))
-                .collect();
-            let core = schwarz_precond::SubdomainCore::uniform(comp_l2g);
-            LocalDomain {
-                subdomain: Subdomain { core },
-                cross_tab: comp_ct,
-                block_diagonals: comp_diag,
-            }
-        })
-        .collect()
+    let mut domains = Vec::with_capacity(components.len());
+    let mut warnings = Vec::new();
+    for ((comp, comp_ct), comp_diag) in components.iter().zip(cross_tabs).zip(diagonals) {
+        if comp_diag.iter().all(|&v| v == 0.0) {
+            continue;
+        }
+        let comp_globals: Vec<u32> = comp
+            .rows
+            .iter()
+            .map(|&i| l2g[i])
+            .chain(comp.cols.iter().map(|&i| l2g[n_rows_full + i]))
+            .collect();
+        let (comp_ct, comp_diag, comp_globals) =
+            sddm::orient_for_elimination(comp_ct, comp_diag, comp_globals);
+        let (mut component, uncertified) = convert(comp_ct, comp_diag, class, &config.scaling)
+            .map_err(|NotScalable| BuildError::UnscalableComponent { pair })?;
+        if class == ComponentClass::General && component.matrix.grounding == Grounding::Grounded {
+            sddm::add_relative_ridge(&mut component.matrix, config.ridge);
+        }
+        if let Some(uncertified) = uncertified {
+            warnings.push(BuildWarning::UnscalableComponent {
+                pair,
+                iterations: uncertified.iterations,
+                violation: uncertified.violation,
+            });
+        }
+        domains.push(LocalDomain {
+            core: schwarz_precond::SubdomainCore::uniform(comp_globals),
+            component,
+        });
+    }
+    Ok((domains, warnings))
 }
 
-/// Compute partition-of-unity weights for overlapping Schwarz subdomains.
-///
-/// The two-sided additive Schwarz formula `M⁻¹ = Σ Rᵢᵀ D̃ᵢ Aᵢ⁻¹ D̃ᵢ Rᵢ`
-/// requires that the squared weights sum to identity at every DOF:
-/// `Σ Rᵢᵀ D̃ᵢ² Rᵢ = I`. For a DOF appearing in `c` subdomains, each weight
-/// is set to `1/√c`, so that `c × (1/√c)² = 1`.
-///
-/// In the common (non-overlapping) case where every DOF belongs to exactly one
-/// subdomain, all weights are 1.0 and the compact `PartitionWeights::Uniform`
-/// representation is used to avoid per-DOF storage.
+/// Two-sided Schwarz needs `Σ Rᵢᵀ D̃ᵢ² Rᵢ = I`, so a DOF in `c` subdomains gets `1/√c`.
 fn compute_partition_weights(domain_pairs: &mut [LocalDomain], n_dofs: usize) {
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    // Pass 1: histogram how many subdomains each DOF appears in. Atomic
-    // increments commute, so the parallel accumulation matches the serial scan.
+    // Atomic increments commute, so the parallel accumulation matches the serial scan.
     let counts: Vec<AtomicU32> = (0..n_dofs).map(|_| AtomicU32::new(0)).collect();
     domain_pairs.par_iter().for_each(|ld| {
-        for &idx in ld.subdomain.core.global_indices() {
+        for &idx in ld.core.global_indices() {
             debug_assert!((idx as usize) < n_dofs);
             counts[idx as usize].fetch_add(1, Ordering::Relaxed);
         }
     });
     let counts: Vec<u32> = counts.into_iter().map(AtomicU32::into_inner).collect();
 
-    // Pass 2: each subdomain's weights depend only on the shared counts, so the
-    // per-domain work is independent.
+    // Each subdomain's weights depend only on shared counts, so per-domain work is independent.
     domain_pairs.par_iter_mut().for_each(|ld| {
-        let d = &mut ld.subdomain;
-        let all_unique = d
+        let all_unique = ld
             .core
             .global_indices()
             .iter()
             .all(|&idx| counts[idx as usize] <= 1);
         if all_unique {
-            d.core.set_uniform_partition_weights();
+            ld.core.set_uniform_partition_weights();
         } else {
-            let weights: Vec<f64> = d
+            let weights: Vec<f64> = ld
                 .core
                 .global_indices()
                 .iter()
@@ -177,7 +195,7 @@ fn compute_partition_weights(domain_pairs: &mut [LocalDomain], n_dofs: usize) {
                     1.0 / (c as f64).sqrt()
                 })
                 .collect();
-            d.core
+            ld.core
                 .set_partition_weights(PartitionWeights::NonUniform(weights))
                 .expect("partition weight count must match index count");
         }
@@ -188,25 +206,27 @@ fn compute_partition_weights(domain_pairs: &mut [LocalDomain], n_dofs: usize) {
 mod tests {
     use super::*;
     use crate::domain::Design;
-    use crate::observation::FactorMajorStore;
+    use crate::observation::ObservationFrame;
+    use crate::Effect;
 
-    fn make_test_design() -> Design<FactorMajorStore> {
-        let store = FactorMajorStore::new(
+    fn make_test_design() -> Design<'static> {
+        let frame = ObservationFrame::new(
             vec![
-                vec![0, 1, 2, 0, 1, 2],
-                vec![0, 1, 0, 1, 0, 1],
-                vec![0, 0, 1, 1, 0, 1],
+                vec![0u32, 1, 2, 0, 1, 2].into(),
+                vec![0u32, 1, 0, 1, 0, 1].into(),
+                vec![0u32, 0, 1, 1, 0, 1].into(),
             ],
-            6,
+            Vec::new(),
         )
-        .expect("valid factor-major store");
-        Design::from_store(store).expect("valid test design")
+        .expect("valid frame");
+        Design::from_frame(frame).expect("valid test design")
     }
 
     #[test]
     fn test_full_cover_domain_count() {
         let dm = make_test_design();
-        let domain_pairs = build_local_domains(&dm, None);
+        let (domain_pairs, _) = build_local_domains(&dm, None, &LocalSolverConfig::default())
+            .expect("plain domains build");
         // 3 factor pairs; each pair may produce multiple components
         assert!(domain_pairs.len() >= 3);
     }
@@ -214,14 +234,14 @@ mod tests {
     #[test]
     fn test_partition_of_unity() {
         let dm = make_test_design();
-        let domain_pairs = build_local_domains(&dm, None);
+        let (domain_pairs, _) = build_local_domains(&dm, None, &LocalSolverConfig::default())
+            .expect("plain domains build");
         let n_dofs = dm.n_dofs;
         // Two-sided PoU: squared weights must sum to 1 at every DOF.
         let mut weight_sq_sum = vec![0.0; n_dofs];
         for ld in &domain_pairs {
-            let d = &ld.subdomain;
-            for (i, &idx) in d.core.global_indices().iter().enumerate() {
-                let w = d.core.partition_weights().get(i);
+            for (i, &idx) in ld.core.global_indices().iter().enumerate() {
+                let w = ld.core.partition_weights().get(i);
                 weight_sq_sum[idx as usize] += w * w;
             }
         }
@@ -233,12 +253,53 @@ mod tests {
     }
 
     #[test]
+    fn slope_design_keeps_uniform_partition_weights() {
+        // Slope designs keep uniform weights; 1/√c reweighting collapses their convergence (#94).
+        let levels_a = [0u32, 1, 2, 0, 1, 2];
+        let levels_b = [0u32, 1, 0, 1, 0, 1];
+        let levels_c = [0u32, 0, 1, 1, 0, 1];
+        let z = [1.0, -2.0, 0.5, 3.0, -1.5, 2.5];
+        let design = Design::new(vec![
+            Effect::new(&levels_a, true, [&z[..]]).expect("slope effect"),
+            Effect::new(&levels_b, true, []).expect("effect b"),
+            Effect::new(&levels_c, true, []).expect("effect c"),
+        ])
+        .expect("valid slope design");
+
+        let (domain_pairs, _) = build_local_domains(&design, None, &LocalSolverConfig::default())
+            .expect("slope domains build");
+
+        for ld in &domain_pairs {
+            for i in 0..ld.core.global_indices().len() {
+                assert_eq!(
+                    ld.core.partition_weights().get(i),
+                    1.0,
+                    "slope design must keep uniform partition weights"
+                );
+            }
+        }
+
+        // Non-vacuity: without a shared DOF, uniform vs 1/√c weights are indistinguishable.
+        let mut counts = vec![0u32; design.n_dofs];
+        for ld in &domain_pairs {
+            for &idx in ld.core.global_indices() {
+                counts[idx as usize] += 1;
+            }
+        }
+        assert!(
+            counts.iter().any(|&c| c > 1),
+            "test is vacuous: build a design whose subdomains share a DOF"
+        );
+    }
+
+    #[test]
     fn test_domains_cover_all_dofs() {
         let dm = make_test_design();
-        let domain_pairs = build_local_domains(&dm, None);
+        let (domain_pairs, _) = build_local_domains(&dm, None, &LocalSolverConfig::default())
+            .expect("plain domains build");
         let mut covered = vec![false; dm.n_dofs];
         for ld in &domain_pairs {
-            for &idx in ld.subdomain.core.global_indices() {
+            for &idx in ld.core.global_indices() {
                 covered[idx as usize] = true;
             }
         }

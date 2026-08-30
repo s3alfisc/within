@@ -13,6 +13,8 @@ target
 __pycache__/
 *.py[cod]
 *.proptest-regressions
+mutants.out/
+*.profraw
 
 # R build/check artifacts
 *.Rcheck/
@@ -23,3 +25,9 @@ __pycache__/
 
 # Serena MCP
 .serena/
+
+.vscode/
+.idea/
+.claude/
+.codex/
+.DS_Store

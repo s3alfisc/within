@@ -3,23 +3,19 @@
 //! Mirrors `crates/within-py/src/api.rs`: the one-shot `solve`/`solve_batch`
 //! bindings plus the persistent `Solver` surface.
 
-use extendr_api::prelude::*;
+use extendr_api::{error::Result, prelude::*};
 
-use within::observation::FactorMajorStore;
 use within::{
-    solve as solve_native, solve_batch as solve_batch_native, Design, Preconditioner,
+    solve as solve_native, solve_batch as solve_batch_native, Preconditioner,
     Solver as NativeSolver,
 };
 
 use crate::config::{parse_lsmr_options, parse_preconditioner, PreconditionerArg};
-use crate::convert::{
-    cast_categories, categories_view, err, extract_weights, factor_major_store, or_throw,
-    usize_to_i32, weights_slice,
-};
+use crate::convert::{err, extract_weights, or_throw, parse_design, usize_to_i32, weights_slice};
 use crate::results::{batch_result_to_list, result_to_list};
 
 /// Owned-store solver held behind the R external pointer.
-pub(crate) type SolverHandle = NativeSolver<FactorMajorStore>;
+pub(crate) type SolverHandle = NativeSolver<'static>;
 
 /// Borrow the columns of an R numeric matrix as slices.
 ///
@@ -40,26 +36,19 @@ fn matrix_columns(matrix: &RMatrix<f64>) -> Vec<&[f64]> {
 
 // Solve fixed-effects normal equations for a single response vector.
 #[extendr]
-fn solve_impl(
-    categories: RMatrix<i32>,
-    y: &[f64],
-    options: Robj,
-    weights: Robj,
-    preconditioner: Robj,
-) -> List {
+fn solve_impl(design: Robj, y: &[f64], options: Robj, weights: Robj, preconditioner: Robj) -> List {
     or_throw((|| -> Result<List> {
-        let cats_u32 = cast_categories(categories.data())?;
-        let cats = categories_view(&categories, &cats_u32)?;
+        let design = parse_design(&design)?;
         let lsmr = parse_lsmr_options(&options)?;
         let weights = weights_slice(&weights)?;
 
         match parse_preconditioner(preconditioner)? {
             PreconditionerArg::Config(config) => {
-                solve_native(cats, y, weights, &lsmr, config.as_ref())
+                solve_native(design, y, weights, &lsmr, config.as_ref())
                     .map_err(|e| err(e.to_string()))
                     .and_then(result_to_list)
             }
-            PreconditionerArg::Built(built) => solve_native(cats, y, weights, &lsmr, built)
+            PreconditionerArg::Built(built) => solve_native(design, y, weights, &lsmr, built)
                 .map_err(|e| err(e.to_string()))
                 .and_then(result_to_list),
         }
@@ -69,35 +58,33 @@ fn solve_impl(
 // Solve fixed-effects normal equations for multiple response vectors.
 #[extendr]
 fn solve_batch_impl(
-    categories: RMatrix<i32>,
+    design: Robj,
     y_matrix: RMatrix<f64>,
     options: Robj,
     weights: Robj,
     preconditioner: Robj,
 ) -> List {
     or_throw((|| -> Result<List> {
-        if y_matrix.nrows() != categories.nrows() {
+        let design = parse_design(&design)?;
+        if y_matrix.nrows() != design.n_obs() {
             return Err(err(format!(
-                "Y has {} rows but categories has {} observations",
+                "Y has {} rows but design has {} observations",
                 y_matrix.nrows(),
-                categories.nrows()
+                design.n_obs()
             )));
         }
-
-        let cats_u32 = cast_categories(categories.data())?;
-        let cats = categories_view(&categories, &cats_u32)?;
         let lsmr = parse_lsmr_options(&options)?;
         let weights = weights_slice(&weights)?;
         let column_refs = matrix_columns(&y_matrix);
 
         match parse_preconditioner(preconditioner)? {
             PreconditionerArg::Config(config) => {
-                solve_batch_native(cats, &column_refs, weights, &lsmr, config.as_ref())
+                solve_batch_native(design, &column_refs, weights, &lsmr, config.as_ref())
                     .map_err(|e| err(e.to_string()))
                     .and_then(batch_result_to_list)
             }
             PreconditionerArg::Built(built) => {
-                solve_batch_native(cats, &column_refs, weights, &lsmr, built)
+                solve_batch_native(design, &column_refs, weights, &lsmr, built)
                     .map_err(|e| err(e.to_string()))
                     .and_then(batch_result_to_list)
             }
@@ -111,15 +98,10 @@ fn solve_batch_impl(
 
 // Build a persistent solver that can be reused across multiple solves.
 #[extendr]
-fn solver_new_impl(
-    categories: RMatrix<i32>,
-    weights: Robj,
-    preconditioner: Robj,
-) -> ExternalPtr<SolverHandle> {
+fn solver_new_impl(design: Robj, weights: Robj, preconditioner: Robj) -> ExternalPtr<SolverHandle> {
     or_throw((|| -> Result<ExternalPtr<SolverHandle>> {
         let weights = extract_weights(weights)?;
-        let store = factor_major_store(&categories)?;
-        let design = Design::from_store(store).map_err(|e| err(e.to_string()))?;
+        let design = parse_design(&design)?;
 
         let solver = match parse_preconditioner(preconditioner)? {
             PreconditionerArg::Config(config) => {

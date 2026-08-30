@@ -1,13 +1,13 @@
 //! Shared R ↔ Rust coercion helpers and error plumbing for the bridge.
 //!
-//! R users pass **1-based** integer category matrices. This module validates
-//! that all entries are >= 1 and contain no `NA`, then subtracts 1 to produce
-//! the **0-based** `u32` indices expected by the Rust solver.
+//! R users pass **1-based** integer factor labels. This module validates that
+//! all entries are positive and contain no `NA`, then subtracts 1 to produce
+//! the caller labels used by the Rust solver.
 
-use extendr_api::prelude::*;
+use extendr_api::{error::Result, prelude::*};
 use ndarray::{ArrayView2, ShapeBuilder};
 
-use within::observation::FactorMajorStore;
+use within::{Design, Effect, IntoDesign};
 
 pub(crate) fn err(message: impl Into<String>) -> Error {
     Error::Other(message.into())
@@ -41,6 +41,21 @@ pub(crate) fn parse_positive_f64(field: &Robj, name: &str) -> Result<f64> {
 
     if !value.is_finite() || value <= 0.0 {
         return Err(err(format!("{name} must be a positive finite number")));
+    }
+    Ok(value)
+}
+
+pub(crate) fn parse_nonnegative_f64(field: &Robj, name: &str) -> Result<f64> {
+    let value = if let Some(value) = field.as_real() {
+        value
+    } else if let Some(value) = field.as_integer() {
+        value as f64
+    } else {
+        return Err(err(format!("{name} must be a non-negative finite number")));
+    };
+
+    if !value.is_finite() || value < 0.0 {
+        return Err(err(format!("{name} must be a non-negative finite number")));
     }
     Ok(value)
 }
@@ -131,13 +146,99 @@ pub(crate) fn categories_view<'a>(
         .map_err(|e| err(e.to_string()))
 }
 
-pub(crate) fn factor_major_store(categories: &RMatrix<i32>) -> Result<FactorMajorStore> {
-    let n_obs = categories.nrows();
-    let n_factors = categories.ncols();
+fn categories_design(categories: &RMatrix<i32>) -> Result<Design<'static>> {
     let cats_u32 = cast_categories(categories.data())?;
     let cats = categories_view(categories, &cats_u32)?;
-    let factor_levels = (0..n_factors)
-        .map(|factor| cats.column(factor).iter().copied().collect())
-        .collect();
-    FactorMajorStore::new(factor_levels, n_obs).map_err(|e| err(e.to_string()))
+    cats.into_design()
+        .map(Design::into_owned)
+        .map_err(|e| err(e.to_string()))
+}
+
+struct OwnedEffect {
+    levels: Vec<u32>,
+    intercept: bool,
+    slopes: Vec<Vec<f64>>,
+}
+
+fn parse_effect(obj: Robj, term: usize) -> Result<OwnedEffect> {
+    if !obj.inherits("within_effect") {
+        return Err(err(format!(
+            "design term {} must be created by Effect(...)",
+            term + 1
+        )));
+    }
+
+    let levels_obj = get_field_or_null(&obj, "levels");
+    let levels = levels_obj
+        .as_integer_slice()
+        .ok_or_else(|| err(format!("design term {} levels must be integer", term + 1)))?;
+    let levels = cast_categories(levels)?;
+
+    let intercept = get_field_or_null(&obj, "intercept")
+        .as_bool()
+        .ok_or_else(|| {
+            err(format!(
+                "design term {} intercept must be TRUE or FALSE",
+                term + 1
+            ))
+        })?;
+
+    let slopes_obj = get_field_or_null(&obj, "slopes");
+    let slopes_list = slopes_obj
+        .as_list()
+        .ok_or_else(|| err(format!("design term {} slopes must be a list", term + 1)))?;
+    let slopes = slopes_list
+        .values()
+        .enumerate()
+        .map(|(slope, value)| {
+            value.as_real_vector().ok_or_else(|| {
+                err(format!(
+                    "design term {} slope {} must be numeric",
+                    term + 1,
+                    slope + 1
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(OwnedEffect {
+        levels,
+        intercept,
+        slopes,
+    })
+}
+
+/// Parse an R category matrix or list of `Effect()` terms into an owned native
+/// design. Owning the columns keeps persistent solver handles independent of
+/// the lifetime and mutability of their originating R objects.
+pub(crate) fn parse_design(design: &Robj) -> Result<Design<'static>> {
+    if design.is_matrix() {
+        let categories = RMatrix::<i32>::try_from(design)
+            .map_err(|_| err("design matrices must contain integer factor labels"))?;
+        return categories_design(&categories);
+    }
+
+    let terms = design
+        .as_list()
+        .ok_or_else(|| err("design must be an integer matrix or a list of Effect() terms"))?;
+    let owned = terms
+        .values()
+        .enumerate()
+        .map(|(term, obj)| parse_effect(obj, term))
+        .collect::<Result<Vec<_>>>()?;
+    let effects = owned
+        .iter()
+        .map(|effect| {
+            Effect::new(
+                &effect.levels,
+                effect.intercept,
+                effect.slopes.iter().map(Vec::as_slice),
+            )
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| err(e.to_string()))?;
+
+    Design::new(effects)
+        .map(Design::into_owned)
+        .map_err(|e| err(e.to_string()))
 }

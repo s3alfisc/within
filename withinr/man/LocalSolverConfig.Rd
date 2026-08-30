@@ -6,18 +6,24 @@
 \usage{
 LocalSolverConfig(
   approx_chol = NULL,
-  approx_schur = .default_approx_schur(),
-  dense_threshold = NULL
+  schur = NULL,
+  dense_threshold = NULL,
+  scaling = NULL,
+  ridge = NULL
 )
 }
 \arguments{
 \item{approx_chol}{\code{NULL} for the library default, or an
 \code{\link[=ApproxCholConfig]{ApproxCholConfig()}} object.}
 
-\item{approx_schur}{Omitted for the library default approximate Schur,
-\code{NULL} for exact Schur, or an \code{\link[=ApproxSchurConfig]{ApproxSchurConfig()}} object.}
+\item{schur}{\code{NULL} for the library default, \code{Schur$Exact}, or an object
+created by \code{Schur$Approximate()}.}
 
 \item{dense_threshold}{Optional non-negative integer dense Schur threshold.}
+
+\item{scaling}{\code{NULL} for the library default, or a \code{\link[=ScalingConfig]{ScalingConfig()}} object.}
+
+\item{ridge}{Optional non-negative local spectral floor.}
 }
 \value{
 A local-solver configuration object accepted by \code{\link[=AdditiveSchwarz]{AdditiveSchwarz()}}.

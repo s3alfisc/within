@@ -1,23 +1,25 @@
 """Edge case tests for the within fixed-effects solver.
 
-Covers: NaN/Inf inputs, zero/negative weights, degenerate problems,
-non-contiguous arrays, low maxiter, and config boundary values.
+Covers: NaN/Inf input rejection, degenerate problems, non-contiguous arrays,
+low maxiter, and config boundary values. Pathological-weight tolerance
+(zero/negative/tiny/huge) is covered with strong oracles on the Rust side
+(edge_cases.rs); the binding only needs the NaN/Inf validation contract here.
 """
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pytest
 
-from within import LsmrOptions, PreconditionerConfig, Solver, solve
+from within import LsmrOptions, PreconditionerConfig, Solver, solve, solve_batch
 
-
-def as_solver_categories(cats):
-    return np.asfortranarray(np.column_stack(cats).astype(np.uint32))
+from conftest import as_solver_categories
 
 
 # ---------------------------------------------------------------------------
-# NaN / Inf propagation
+# NaN / Inf validation (binding contract)
 # ---------------------------------------------------------------------------
 
 
@@ -36,87 +38,21 @@ class TestNanInfPropagation:
         with pytest.raises(ValueError, match="finite"):
             solve(cats, y)
 
-    def test_nan_in_weights_propagates_or_raises(self):
-        """NaN weight should either raise or produce NaN/non-converged result."""
+    def test_nan_in_weights_rejected(self):
+        """NaN in weights should be rejected at build validation."""
         cats = as_solver_categories([np.array([0, 1, 0]), np.array([0, 0, 1])])
         y = np.array([1.0, 2.0, 3.0])
         w = np.array([1.0, np.nan, 1.0])
-        try:
-            result = solve(cats, y, weights=w)
-            assert np.any(np.isnan(result.x)) or not result.converged
-        except Exception:
-            pass  # raising is also acceptable
+        with pytest.raises(ValueError, match="finite"):
+            solve(cats, y, weights=w)
 
-    def test_inf_in_weights_propagates_or_raises(self):
-        """Inf weight should either raise or produce non-finite/non-converged result."""
+    def test_inf_in_weights_rejected(self):
+        """Inf in weights should be rejected at build validation."""
         cats = as_solver_categories([np.array([0, 1, 0]), np.array([0, 0, 1])])
         y = np.array([1.0, 2.0, 3.0])
         w = np.array([1.0, np.inf, 1.0])
-        try:
-            result = solve(cats, y, weights=w)
-            assert np.any(~np.isfinite(result.x)) or not result.converged
-        except Exception:
-            pass  # raising is also acceptable
-
-
-# ---------------------------------------------------------------------------
-# Weight edge cases
-# ---------------------------------------------------------------------------
-
-
-class TestWeightEdgeCases:
-    def test_zero_weights_raises_or_fails(self):
-        """All-zero weights produce a singular system; should raise or not converge."""
-        cats = as_solver_categories(
-            [np.array([0, 1, 0, 1, 2]), np.array([0, 0, 1, 1, 0])]
-        )
-        y = np.ones(5)
-        w = np.zeros(5)
-        try:
-            result = solve(
-                cats, y, weights=w, preconditioner=PreconditionerConfig.Additive
-            )
-            assert not result.converged
-        except Exception:
-            pass  # raising is also acceptable
-
-    def test_negative_weights_does_not_crash(self):
-        """Negative weights break positive-definiteness; no crash required."""
-        cats = as_solver_categories(
-            [np.array([0, 1, 0, 1, 2]), np.array([0, 0, 1, 1, 0])]
-        )
-        y = np.ones(5)
-        w = np.array([1.0, -1.0, 1.0, 1.0, 1.0])
-        try:
+        with pytest.raises(ValueError, match="finite"):
             solve(cats, y, weights=w)
-        except Exception:
-            pass  # either outcome is acceptable
-
-    def test_very_small_weights_do_not_crash(self):
-        """Near-zero weights (but positive) should not crash."""
-        cats = as_solver_categories(
-            [np.array([0, 1, 0, 1, 2]), np.array([0, 0, 1, 1, 0])]
-        )
-        y = np.ones(5)
-        w = np.array([1e-300, 1e-300, 1e-300, 1e-300, 1e-300])
-        try:
-            result = solve(cats, y, weights=w)
-            assert isinstance(result.converged, bool)
-        except Exception:
-            pass  # raising is also acceptable
-
-    def test_large_weights_do_not_crash(self):
-        """Very large (but finite) weights should not crash."""
-        cats = as_solver_categories(
-            [np.array([0, 1, 0, 1, 2]), np.array([0, 0, 1, 1, 0])]
-        )
-        y = np.ones(5)
-        w = np.full(5, 1e300)
-        try:
-            result = solve(cats, y, weights=w)
-            assert isinstance(result.converged, bool)
-        except Exception:
-            pass  # raising is also acceptable
 
 
 # ---------------------------------------------------------------------------
@@ -143,14 +79,14 @@ class TestDegenerateY:
         )
         y = np.full(100, 5.0)
         result = solve(cats, y)
-        if result.converged:
-            np.testing.assert_allclose(result.demeaned, 0.0, atol=1e-4)
+        assert result.converged
+        np.testing.assert_allclose(result.demeaned, 0.0, atol=1e-4)
 
     def test_all_same_category_assignments(self):
         """All observations in one group per factor leaves no variation to explain."""
         cats = np.zeros((5, 2), dtype=np.uint32, order="F")
         y = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
-        result = solve(cats, y, preconditioner=PreconditionerConfig.Off)
+        result = solve(cats, y, preconditioner=PreconditionerConfig.Off())
         assert np.all(np.isfinite(result.x))
 
 
@@ -167,7 +103,7 @@ class TestSolverConfigLimits:
             [rng.integers(0, 50, size=1000), rng.integers(0, 50, size=1000)]
         )
         y = rng.standard_normal(1000)
-        result = solve(cats, y, LsmrOptions(maxiter=1, tol=1e-15))
+        result = solve(cats, y, options=LsmrOptions(maxiter=1, tol=1e-15))
         assert not result.converged
         assert np.all(np.isfinite(result.x))
 
@@ -178,7 +114,7 @@ class TestSolverConfigLimits:
             [rng.integers(0, 50, size=1000), rng.integers(0, 50, size=1000)]
         )
         y = rng.standard_normal(1000)
-        result = solve(cats, y, LsmrOptions(maxiter=2, tol=1e-15))
+        result = solve(cats, y, options=LsmrOptions(maxiter=2, tol=1e-15))
         assert not result.converged
         assert np.all(np.isfinite(result.x))
 
@@ -188,7 +124,7 @@ class TestSolverConfigLimits:
             [np.array([0, 1, 0, 1, 2]), np.array([0, 0, 1, 1, 0])]
         )
         y = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
-        result = solve(cats, y, LsmrOptions(tol=1e-14))
+        result = solve(cats, y, options=LsmrOptions(tol=1e-14))
         assert np.all(np.isfinite(result.x))
 
     def test_tol_1_converges_immediately(self):
@@ -198,32 +134,9 @@ class TestSolverConfigLimits:
             [rng.integers(0, 20, size=200), rng.integers(0, 20, size=200)]
         )
         y = rng.standard_normal(200)
-        result = solve(cats, y, LsmrOptions(tol=1.0))
+        result = solve(cats, y, options=LsmrOptions(tol=1.0))
         assert result.converged
         assert result.iterations <= 5
-
-    def test_config_zero_tol_does_not_crash(self):
-        """tol=0.0 effectively demands machine precision; no crash required."""
-        cats = as_solver_categories(
-            [np.array([0, 1, 0, 1, 2]), np.array([0, 0, 1, 1, 0])]
-        )
-        y = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
-        try:
-            result = solve(cats, y, LsmrOptions(tol=0.0))
-            assert np.all(np.isfinite(result.x))
-        except Exception:
-            pass  # raising is also acceptable
-
-    def test_config_nan_tol_does_not_crash(self):
-        """NaN tol is pathological; no crash required."""
-        cats = as_solver_categories([np.array([0, 1, 0]), np.array([0, 0, 1])])
-        y = np.array([1.0, 2.0, 3.0])
-        try:
-            result = solve(cats, y, LsmrOptions(tol=float("nan")))
-            # If it ran, result should be finite or non-converged
-            assert isinstance(result.converged, bool)
-        except Exception:
-            pass  # raising is also acceptable
 
 
 # ---------------------------------------------------------------------------
@@ -232,26 +145,6 @@ class TestSolverConfigLimits:
 
 
 class TestMinimalProblemSizes:
-    def test_single_observation_does_not_crash(self):
-        """A single-row problem is degenerate but should not crash."""
-        cats = np.array([[0, 0]], dtype=np.uint32, order="F")
-        y = np.array([5.0])
-        try:
-            result = solve(cats, y, preconditioner=PreconditionerConfig.Off)
-            assert np.all(np.isfinite(result.x))
-        except Exception:
-            pass  # singular system raising is acceptable
-
-    def test_two_observations_two_factors_does_not_crash(self):
-        """Minimal over-determined problem."""
-        cats = np.array([[0, 0], [1, 1]], dtype=np.uint32, order="F")
-        y = np.array([1.0, 2.0])
-        try:
-            result = solve(cats, y, preconditioner=PreconditionerConfig.Off)
-            assert np.all(np.isfinite(result.x))
-        except Exception:
-            pass  # acceptable
-
     def test_two_factor_levels_each_converges(self):
         """Small but well-connected problem with two levels per factor."""
         cats = as_solver_categories([np.array([0, 0, 1, 1]), np.array([0, 1, 0, 1])])
@@ -260,9 +153,18 @@ class TestMinimalProblemSizes:
         assert result.converged
         assert np.all(np.isfinite(result.x))
 
+    def test_empty_batch_returns_zero_column_results(self):
+        """Y with zero columns returns well-shaped (n, 0) results."""
+        cats = as_solver_categories([np.array([0, 0, 1, 1]), np.array([0, 1, 0, 1])])
+        Y = np.empty((4, 0), dtype=np.float64)
+        result = solve_batch(cats, Y)
+        assert result.demeaned.shape == (4, 0)
+        assert result.x.shape[1] == 0
+        assert len(result.converged) == 0
+
 
 # ---------------------------------------------------------------------------
-# Non-contiguous input arrays
+# Non-contiguous input arrays (binding contract)
 # ---------------------------------------------------------------------------
 
 
@@ -283,10 +185,8 @@ class TestNonContiguousInputs:
         result_contiguous = solve(cats, y_direct)
         result_strided = solve(cats, y_strided)
 
-        if result_contiguous.converged and result_strided.converged:
-            np.testing.assert_allclose(
-                result_contiguous.x, result_strided.x, atol=1e-12
-            )
+        assert result_contiguous.converged and result_strided.converged
+        np.testing.assert_allclose(result_contiguous.x, result_strided.x, atol=1e-12)
 
     def test_non_contiguous_weights_gives_same_result_as_contiguous(self):
         """Non-contiguous weights should give the same result as contiguous."""
@@ -304,10 +204,8 @@ class TestNonContiguousInputs:
         result_contiguous = solve(cats, y, weights=w_direct)
         result_strided = solve(cats, y, weights=w_strided)
 
-        if result_contiguous.converged and result_strided.converged:
-            np.testing.assert_allclose(
-                result_contiguous.x, result_strided.x, atol=1e-12
-            )
+        assert result_contiguous.converged and result_strided.converged
+        np.testing.assert_allclose(result_contiguous.x, result_strided.x, atol=1e-12)
 
     def test_c_contiguous_categories_emits_warning(self):
         """C-contiguous (row-major) categories should emit a UserWarning."""
@@ -318,6 +216,18 @@ class TestNonContiguousInputs:
         y = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
         with pytest.warns(UserWarning, match="F-contiguous"):
             solve(cats_c, y)
+
+    def test_c_contiguous_categories_warns_once_in_batch(self):
+        """solve_batch should emit the F-contiguity warning exactly once."""
+        cats_c = np.array(
+            [[0, 0], [1, 0], [0, 1], [1, 1], [0, 0]], dtype=np.uint32, order="C"
+        )
+        Y = np.column_stack([np.arange(5.0), np.arange(5.0) ** 2])
+        with warnings.catch_warnings(record=True) as record:
+            warnings.simplefilter("always")
+            solve_batch(cats_c, Y)
+        contiguity = [w for w in record if "F-contiguous" in str(w.message)]
+        assert len(contiguity) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +243,7 @@ class TestNoPreconditioner:
             [rng.integers(0, 10, size=200), rng.integers(0, 10, size=200)]
         )
         y = rng.standard_normal(200)
-        result = solve(cats, y, preconditioner=PreconditionerConfig.Off)
+        result = solve(cats, y, preconditioner=PreconditionerConfig.Off())
         assert result.converged
         assert np.all(np.isfinite(result.x))
 
@@ -343,13 +253,13 @@ class TestNoPreconditioner:
             [np.array([0, 1, 0, 1, 2]), np.array([0, 0, 1, 1, 0])]
         )
         y = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
-        result = solve(cats, y, preconditioner=PreconditionerConfig.Off)
+        result = solve(cats, y, preconditioner=PreconditionerConfig.Off())
         assert np.all(np.isfinite(result.x))
 
     def test_solver_preconditioner_none_returns_none(self):
-        """Solver built with PreconditionerConfig.Off should return None from preconditioner()."""
+        """Solver built with PreconditionerConfig.Off() should return None from preconditioner()."""
         cats = as_solver_categories(
             [np.array([0, 1, 0, 1, 2]), np.array([0, 0, 1, 1, 0])]
         )
-        solver = Solver(cats, preconditioner=PreconditionerConfig.Off)
+        solver = Solver(cats, preconditioner=PreconditionerConfig.Off())
         assert solver.preconditioner is None

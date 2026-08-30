@@ -42,8 +42,24 @@ withinr_run_tests <- function(verbose = TRUE) {
   assert_true(is.list(r), "solve() did not return a list.")
   assert_equal(
     names(r),
-    c("x", "demeaned", "converged", "iterations", "residual", "time_total", "time_setup", "time_solve"),
+    c(
+      "x", "unidentified", "warnings", "layout", "demeaned", "converged",
+      "iterations", "residual", "time_total", "time_setup", "time_solve"
+    ),
     msg = "solve() returned unexpected list fields."
+  )
+  assert_true(is.list(r$unidentified), "solve() unidentified metadata is not a list.")
+  assert_true(is.character(r$warnings), "solve() warnings metadata is not character.")
+  assert_true(
+    inherits(r$layout, "within_coefficient_layout"),
+    "solve() layout metadata is not a coefficient-layout handle."
+  )
+  assert_equal(r$layout$n_dofs, length(r$x), msg = "layout$n_dofs mismatch.")
+  first_address <- r$layout$address(1L)
+  assert_equal(
+    r$layout$index(first_address$term, first_address$level, first_address$column),
+    1L,
+    msg = "layout index/address round trip failed."
   )
   assert_true(isTRUE(r$converged), "solve() did not converge on smoke case.")
   assert_true(is.double(r$x), "solve() x is not double.")
@@ -66,7 +82,9 @@ withinr_run_tests <- function(verbose = TRUE) {
   schwarz <- withinr::AdditiveSchwarz(
     local_solver = withinr::LocalSolverConfig(
       approx_chol = withinr::ApproxCholConfig(split_merge = 2L),
-      approx_schur = withinr::ApproxSchurConfig(split = 1L)
+      schur = withinr::Schur$Approximate(withinr::ApproxSchurConfig(split = 1L)),
+      scaling = withinr::ScalingConfig(on_failure = withinr::ScalingFailure$Warn),
+      ridge = 1e-10
     ),
     reduction = withinr::ReductionStrategy$Auto
   )
@@ -97,6 +115,7 @@ withinr_run_tests <- function(verbose = TRUE) {
   assert_true(nrow(b$demeaned) == 4L, "solve_batch() demeaned row count mismatch.")
   assert_true(length(b$converged) == 2L, "solve_batch() converged vector length mismatch.")
   assert_true(all(b$converged), "solve_batch() did not converge for all RHS.")
+  assert_true(b$time_setup >= 0, "solve_batch() time_setup is negative.")
 
   s1 <- withinr::within_solve(cats_2x2, Y[, 1])
   s2 <- withinr::within_solve(cats_2x2, Y[, 2])
@@ -117,6 +136,8 @@ withinr_run_tests <- function(verbose = TRUE) {
     "preconditioner print does not report the Additive variant."
   )
   assert_equal(length(p$apply(rep(1, p$ncols))), p$nrows, msg = "preconditioner apply length mismatch.")
+  assert_true(p$build_duration_seconds >= 0, "preconditioner build duration is negative.")
+  assert_equal(p$config$variant, "Additive", msg = "preconditioner config variant mismatch.")
 
   solver_diag <- withinr::Solver(cats_2x2, preconditioner = withinr::PreconditionerConfig$Diagonal)
   p_diag <- solver_diag$preconditioner()
@@ -140,18 +161,46 @@ withinr_run_tests <- function(verbose = TRUE) {
   assert_equal(solver2$solve(y_simple)$demeaned, s1$demeaned, tol = 1e-6, msg = "Preconditioner reuse mismatch.")
 
   # validation/error behavior
-  assert_error(withinr::within_solve(c(1L, 2L), y_simple), contains = "must be a matrix")
+  assert_error(withinr::within_solve(c(1L, 2L), y_simple), contains = "category matrix")
   assert_error(withinr::within_solve_batch(cats_2x2, y_simple), contains = "must be a matrix")
 
   bad <- cats_2x2
   bad[1, 1] <- NA_integer_
-  assert_error(withinr::within_solve(bad, y_simple), contains = "must not contain NA")
+  assert_error(withinr::within_solve(bad, y_simple), contains = "no NAs")
 
   bad0 <- cats_2x2 - 1L
   assert_error(withinr::within_solve(bad0, y_simple), contains = "1-based")
 
   cats_dbl <- matrix(c(1, 1, 2, 2, 1, 2, 1, 2), ncol = 2)
   assert_true(withinr::within_solve(cats_dbl, y_simple)$converged, "Numeric categories coercion case failed.")
+
+  cats_fractional <- cats_dbl
+  cats_fractional[1, 1] <- 1.5
+  assert_error(withinr::within_solve(cats_fractional, y_simple), contains = "finite integers")
+
+  # Varying slopes and effect-list designs
+  slope <- c(-1.0, 0.5, 1.5, 2.0)
+  effects <- list(
+    withinr::Effect(cats_2x2[, 1], slopes = slope),
+    withinr::Effect(cats_2x2[, 2])
+  )
+  effect_result <- withinr::within_solve(
+    effects,
+    y_simple,
+    preconditioner = withinr::PreconditionerConfig$Diagonal
+  )
+  assert_true(effect_result$converged, "Effect-list solve failed.")
+  assert_equal(length(effect_result$demeaned), length(y_simple), msg = "Effect-list demeaned length mismatch.")
+  effect_solver <- withinr::Solver(
+    effects,
+    preconditioner = withinr::PreconditionerConfig$Diagonal
+  )
+  assert_equal(
+    effect_solver$solve(y_simple)$demeaned,
+    effect_result$demeaned,
+    tol = 1e-6,
+    msg = "Persistent Effect-list solve mismatch."
+  )
 
   # Larger deterministic design: preconditioner correctness and caller-order invariance
   set.seed(20260704)

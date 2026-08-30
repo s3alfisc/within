@@ -5,7 +5,7 @@
 \title{Solve fixed-effects normal equations for multiple response vectors}
 \usage{
 within_solve_batch(
-  categories,
+  design,
   Y,
   options = NULL,
   weights = NULL,
@@ -13,9 +13,8 @@ within_solve_batch(
 )
 }
 \arguments{
-\item{categories}{Integer matrix of shape \verb{(n_obs, n_factors)}. Each column
-contains \strong{1-based} factor level assignments. Values must be positive
-integers with no \code{NA}s.}
+\item{design}{Either an integer category matrix of shape
+\verb{(n_obs, n_factors)} with 1-based labels, or a list of \code{\link[=Effect]{Effect()}} terms.}
 
 \item{Y}{Numeric matrix of shape \verb{(n_obs, k)}.}
 
@@ -32,7 +31,8 @@ built \code{\link[=Preconditioner]{Preconditioner()}} object reuses an existing 
 }
 \value{
 A named list with matrix fields \code{x} and \code{demeaned}, plus
-\code{converged}, \code{iterations}, \code{residual}, \code{time_solve}, and \code{time_total}.
+\code{unidentified}, \code{warnings}, \code{layout}, \code{converged},
+\code{iterations}, \code{residual}, \code{time_solve}, \code{time_setup}, and \code{time_total}.
 }
 \description{
 Builds the operator and preconditioner once, then solves for each column

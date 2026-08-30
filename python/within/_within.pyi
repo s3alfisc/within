@@ -7,26 +7,40 @@ Most users should import from ``within`` directly rather than from
 
 import numpy as np
 from numpy.typing import NDArray
-from enum import IntEnum
 
-class PreconditionerConfig(IntEnum):
-    """Preconditioner selection shortcut for the LSMR solver.
+class PreconditionerConfig:
+    """Preconditioner configuration for the LSMR solver.
 
-    Use the enum variants for defaults, or pass an ``AdditiveSchwarz``
-    instance for fine-grained control.
-
-    Attributes:
-        Additive: Additive Schwarz (default).
-        Off: No preconditioner. Useful for debugging or well-conditioned problems.
-        Diagonal: Diagonal/Jacobi preconditioner.
+    A tagged union: each variant is a subclass. Construct with ``Off()``,
+    ``Diagonal()``, or ``Additive(local_solver=..., reduction=...)``. Instances
+    compare by value and support ``match``/``case``.
     """
 
-    Additive = 0
-    Off = 1
-    Diagonal = 2
+    class Off(PreconditionerConfig):
+        """No preconditioner. Useful for debugging or well-conditioned problems."""
 
-class ReductionStrategy(IntEnum):
+        def __init__(self) -> None: ...
+
+    class Diagonal(PreconditionerConfig):
+        """Diagonal/Jacobi preconditioner using ``diag(D^T W D)^{-1}``."""
+
+        def __init__(self) -> None: ...
+
+    class Additive(PreconditionerConfig):
+        """Additive Schwarz with a normalized local-solver configuration."""
+
+        local_solver: LocalSolverConfig
+        reduction: ReductionStrategy
+        def __init__(
+            self,
+            local_solver: LocalSolverConfig = ...,
+            reduction: ReductionStrategy = ...,
+        ) -> None: ...
+
+class ReductionStrategy:
     """Strategy for combining subdomain contributions in additive Schwarz.
+
+    Not an ``Enum``: the members below are class attributes (not iterable).
 
     Attributes:
         Auto: Let the solver choose based on problem structure (recommended).
@@ -34,9 +48,9 @@ class ReductionStrategy(IntEnum):
         ParallelReduction: Use parallel reduction over subdomain results.
     """
 
-    Auto = 0
-    AtomicScatter = 1
-    ParallelReduction = 2
+    Auto: ReductionStrategy
+    AtomicScatter: ReductionStrategy
+    ParallelReduction: ReductionStrategy
 
 class LsmrOptions:
     """Modified LSMR solver configuration.
@@ -58,9 +72,12 @@ class LsmrOptions:
             unpreconditioned, ``2 * local_size * n_dofs`` preconditioned.
     """
 
-    tol: float
-    maxiter: int
-    local_size: int | None
+    @property
+    def tol(self) -> float: ...
+    @property
+    def maxiter(self) -> int: ...
+    @property
+    def local_size(self) -> int | None: ...
     def __init__(
         self,
         tol: float = 1e-8,
@@ -68,18 +85,60 @@ class LsmrOptions:
         local_size: int | None = None,
     ) -> None: ...
 
+class UnidentifiedDirection:
+    """A per-level design direction the data cannot identify.
+
+    Attributes:
+        term: Index into the design's term list.
+        level: Level index within the term (``0..n_levels``).
+        column: Column within the term's per-level block — intercept first
+            (when present), then slopes in declaration order.
+    """
+
+    @property
+    def term(self) -> int: ...
+    @property
+    def level(self) -> int: ...
+    @property
+    def column(self) -> int: ...
+
+class CoefficientLayout:
+    """Translate a ``(term, level, column)`` coefficient address to its flat
+    ``SolveResult.x`` index and back, so callers need not reconstruct the
+    term-major offset formula.
+
+    ``n_levels``, ``n_columns``, ``index``, and ``address`` raise ``IndexError``
+    on an out-of-range coordinate rather than returning a wrong value.
+    """
+
+    def n_dofs(self) -> int: ...
+    def n_terms(self) -> int: ...
+    def n_levels(self, term: int) -> int: ...
+    def n_columns(self, term: int) -> int: ...
+    def index(self, term: int, level: int, column: int) -> int: ...
+    def address(self, index: int) -> tuple[int, int, int]: ...
+
 class SolveResult:
     """Result of a single fixed-effects solve.
 
     Attributes:
-        x: Fixed-effect coefficients, shape ``(n_dofs,)``. The DOF ordering
-            matches the factor levels: all levels of factor 0 first, then
-            factor 1, etc.
+        x: Fixed-effect coefficients, shape ``(n_dofs,)``. Term-major:
+            coefficient column ``c`` of level ``level`` sits at
+            ``term_offset + c * n_levels + level``, columns ordered
+            ``[intercept?, slopes...]`` (for plain factors: all levels of
+            factor 0 first, then factor 1, etc.). Slots for unidentified
+            directions hold the minimal-norm value ``0``, never NaN.
+        unidentified: Per-level directions the data cannot identify, as
+            :class:`UnidentifiedDirection` records.
+        layout: Address <-> flat-``x``-index translation for the coefficients.
         demeaned: Response vector after subtracting estimated fixed effects,
             shape ``(n_obs,)``.
         converged: Whether the LSMR solver met the convergence tolerance.
         iterations: Total number of LSMR iterations performed.
-        residual: Final relative residual norm.
+        residual: Relative normal-equation residual
+            ``||D^T W (y - Dx)|| / ||D^T W y||`` estimated from the LSMR
+            recurrence at no extra cost. Exact for an unpreconditioned solve;
+            measured in the preconditioner's metric otherwise.
         time_total: Wall-clock time for the entire solve (setup + solve), in seconds.
         time_setup: Wall-clock time for the setup phase (operator + preconditioner
             construction), in seconds.
@@ -88,6 +147,10 @@ class SolveResult:
 
     @property
     def x(self) -> NDArray[np.float64]: ...
+    @property
+    def unidentified(self) -> list[UnidentifiedDirection]: ...
+    @property
+    def layout(self) -> CoefficientLayout: ...
     @property
     def demeaned(self) -> NDArray[np.float64]: ...
     @property
@@ -110,17 +173,30 @@ class BatchSolveResult:
 
     Attributes:
         x: Fixed-effect coefficients, shape ``(n_dofs, k)`` (column-major).
+            Slots for unidentified directions hold the minimal-norm value
+            ``0``, never NaN.
+        unidentified: Per-level directions the data cannot identify, as
+            :class:`UnidentifiedDirection` records; shared across all RHS.
+        layout: Address <-> flat-``x``-index translation for the coefficients.
         demeaned: Demeaned responses, shape ``(n_obs, k)`` (column-major).
         converged: Whether each RHS converged.
         iterations: Total LSMR iterations for each RHS.
-        residual: Final relative residual norm for each RHS.
+        residual: Per-RHS relative normal-equation residual estimate
+            (see ``SolveResult.residual``).
         time_solve: Wall-clock solve time for each RHS, in seconds.
+        time_setup: Wall-clock time for the shared setup phase (solver and
+            preconditioner construction), in seconds; 0 when a pre-built
+            preconditioner was reused.
         time_total: Wall-clock time for the entire batch (including shared setup),
             in seconds.
     """
 
     @property
     def x(self) -> NDArray[np.float64]: ...
+    @property
+    def unidentified(self) -> list[UnidentifiedDirection]: ...
+    @property
+    def layout(self) -> CoefficientLayout: ...
     @property
     def demeaned(self) -> NDArray[np.float64]: ...
     @property
@@ -132,16 +208,26 @@ class BatchSolveResult:
     @property
     def time_solve(self) -> list[float]: ...
     @property
+    def time_setup(self) -> float: ...
+    @property
     def time_total(self) -> float: ...
 
+class Effect:
+    """One factor's effect: level codes, an optional intercept, and slope covariates."""
+
+    def __init__(
+        self,
+        levels: NDArray[np.uint32],
+        intercept: bool,
+        slopes: list[NDArray[np.float64]] | None = None,
+    ) -> None: ...
+
 def solve(
-    categories: NDArray[np.uint32],
+    design: NDArray[np.uint32] | list[Effect],
     y: NDArray[np.float64],
-    options: LsmrOptions | None = None,
     weights: NDArray[np.float64] | None = None,
-    preconditioner: (
-        PreconditionerConfig | AdditiveSchwarz | Preconditioner | None
-    ) = None,
+    options: LsmrOptions | None = None,
+    preconditioner: (PreconditionerConfig | Preconditioner | None) = None,
 ) -> SolveResult:
     """Solve fixed-effects normal equations for a single response vector.
 
@@ -150,29 +236,38 @@ def solve(
     implied by ``categories`` and ``W`` is the diagonal weight matrix.
 
     Args:
-        categories: Factor assignments, shape ``(n_obs, n_factors)``,
-            dtype ``uint32``. Each column contains zero-based level indices
-            for one factor. Should be F-contiguous (column-major) for best
-            performance; a ``UserWarning`` is emitted for C-contiguous arrays.
+        design: Either a ``(n_obs, n_factors)`` ``uint32`` array of factor
+            assignments (F-contiguous for best performance; a ``UserWarning``
+            is emitted otherwise), or a list of :class:`Effect` terms.
         y: Response vector, shape ``(n_obs,)``, dtype ``float64``.
-        options: LSMR solver tuning. Pass ``LsmrOptions(...)`` to override
-            defaults. Default: ``LsmrOptions(tol=1e-8, maxiter=1000)``.
         weights: Observation weights, shape ``(n_obs,)``, dtype ``float64``.
             Default: unit weights (unweighted).
-        preconditioner: Controls preconditioning. Five input forms are accepted:
+        options: LSMR solver tuning. Pass ``LsmrOptions(...)`` to override
+            defaults. Default: ``LsmrOptions(tol=1e-8, maxiter=1000)``.
+        preconditioner: Controls preconditioning. Accepted forms:
             ``None`` (default) builds the additive Schwarz preconditioner with
-            default settings. ``PreconditionerConfig.Off`` disables it.
-            ``PreconditionerConfig.Diagonal`` uses diagonal/Jacobi scaling.
-            ``AdditiveSchwarz(...)`` overrides the local-solver / reduction
-            settings. A previously-built ``Preconditioner`` instance reuses an
-            existing factorisation.
+            default settings. ``PreconditionerConfig.Off()`` disables it.
+            ``PreconditionerConfig.Diagonal()`` uses diagonal/Jacobi scaling.
+            ``PreconditionerConfig.Additive(...)`` overrides the local-solver /
+            reduction settings. A previously-built ``Preconditioner`` instance
+            reuses an existing factorisation.
 
     Returns:
         A ``SolveResult`` with coefficients, demeaned response, convergence
         info, and timing breakdown.
 
     Raises:
-        ValueError: If dimensions are inconsistent or the solve fails.
+        ValueError: If dimensions or values are inconsistent.
+        TypeError: If an argument has the wrong type or dtype.
+        RuntimeError: If the solve fails at runtime (poisoned lock, or a
+            subdomain solve diverges).
+
+    Note:
+        A single-threaded run (``RAYON_NUM_THREADS=1``) is bitwise-reproducible.
+        Across thread counts, parallel summation reorders floating-point adds,
+        so coefficients differ at the ULP scale — reproducible within solver
+        tolerance, not bitwise. Pin the thread count to keep estimates stable
+        within solver tolerance across runs (only single-threaded is bitwise).
 
     Example::
 
@@ -188,13 +283,11 @@ def solve(
     ...
 
 def solve_batch(
-    categories: NDArray[np.uint32],
+    design: NDArray[np.uint32] | list[Effect],
     Y: NDArray[np.float64],
-    options: LsmrOptions | None = None,
     weights: NDArray[np.float64] | None = None,
-    preconditioner: (
-        PreconditionerConfig | AdditiveSchwarz | Preconditioner | None
-    ) = None,
+    options: LsmrOptions | None = None,
+    preconditioner: (PreconditionerConfig | Preconditioner | None) = None,
 ) -> BatchSolveResult:
     """Solve fixed-effects normal equations for multiple response vectors.
 
@@ -202,11 +295,13 @@ def solve_batch(
     the setup phase (preconditioner construction).
 
     Args:
-        categories: Factor assignments, shape ``(n_obs, n_factors)``, dtype ``uint32``.
+        design: Either a ``(n_obs, n_factors)`` ``uint32`` array of factor
+            assignments (F-contiguous for best performance; a ``UserWarning``
+            is emitted otherwise), or a list of :class:`Effect` terms.
         Y: Response matrix, shape ``(n_obs, k)``, dtype ``float64``. Each column
             is a separate response vector.
-        options: LSMR solver tuning. Default: ``LsmrOptions(tol=1e-8, maxiter=1000)``.
         weights: Observation weights. Default: unit weights.
+        options: LSMR solver tuning. Default: ``LsmrOptions(tol=1e-8, maxiter=1000)``.
         preconditioner: Preconditioner configuration; see :func:`solve` for the
             accepted forms.
 
@@ -214,7 +309,10 @@ def solve_batch(
         A ``BatchSolveResult`` with stacked coefficients and per-RHS metadata.
 
     Raises:
-        ValueError: If dimensions are inconsistent.
+        ValueError: If dimensions or values are inconsistent.
+        TypeError: If an argument has the wrong type or dtype.
+        RuntimeError: If the solve fails at runtime (poisoned lock, or a
+            subdomain solve diverges).
     """
     ...
 
@@ -235,6 +333,10 @@ class Preconditioner:
     def nrows(self) -> int: ...
     @property
     def ncols(self) -> int: ...
+    @property
+    def config(self) -> PreconditionerConfig: ...
+    @property
+    def build_duration_seconds(self) -> float: ...
     def __repr__(self) -> str: ...
     def __reduce__(self) -> tuple: ...
 
@@ -247,11 +349,9 @@ class Solver:
 
     def __init__(
         self,
-        categories: NDArray[np.uint32],
+        design: NDArray[np.uint32] | list[Effect],
         weights: NDArray[np.float64] | None = None,
-        preconditioner: (
-            PreconditionerConfig | AdditiveSchwarz | Preconditioner | None
-        ) = None,
+        preconditioner: (PreconditionerConfig | Preconditioner | None) = None,
     ) -> None: ...
     def solve(
         self,
@@ -283,44 +383,75 @@ class Solver:
 class ApproxCholConfig:
     """Configuration for approximate Cholesky factorization."""
 
-    seed: int
-    split_merge: int | None
+    @property
+    def seed(self) -> int: ...
+    @property
+    def split_merge(self) -> int | None: ...
     def __init__(self, seed: int = 0, split_merge: int | None = None) -> None: ...
 
 class ApproxSchurConfig:
     """Configuration for approximate Schur complement via clique-tree sampling."""
 
-    seed: int
-    split: int
+    @property
+    def seed(self) -> int: ...
+    @property
+    def split(self) -> int: ...
     def __init__(self, seed: int = 0, split: int = 1) -> None: ...
+
+class Schur:
+    """Schur-complement reduction mode for :class:`LocalSolverConfig`.
+
+    Omitting ``schur`` on ``LocalSolverConfig`` uses the library default
+    (approximate); use these static constructors to request a specific mode.
+    """
+
+    @staticmethod
+    def approximate(config: ApproxSchurConfig | None = None) -> Schur: ...
+    @staticmethod
+    def exact() -> Schur: ...
+
+class ScalingConfig:
+    """Certification policy for the diagonal scaling of signed components.
+
+    ``on_failure`` is ``"warn"`` (clamp residual deficits — preconditioner
+    quality only — and emit a ``UserWarning``) or ``"error"`` (fail the build).
+    """
+
+    @property
+    def tolerance(self) -> float: ...
+    @property
+    def max_iterations(self) -> int: ...
+    @property
+    def on_failure(self) -> str: ...
+    def __init__(
+        self,
+        tolerance: float | None = None,
+        max_iterations: int | None = None,
+        on_failure: str | None = None,
+    ) -> None: ...
 
 class LocalSolverConfig:
     """Local solver: Schur reduction + approximate Cholesky.
 
-    Note: the Python-level constructor exposed via ``within.config`` uses an
-    explicit default for ``approx_schur`` (the library-default approximate
-    config). The native PyO3 constructor accepts ``None`` as the *explicit*
-    "exact Schur" signal — see ``python/within/config.py`` for the wrapper
-    that injects the default.
+    Omit ``schur`` for the library default (approximate Schur); pass
+    ``Schur.exact()`` for the exact complement.
     """
 
-    approx_chol: ApproxCholConfig | None
-    approx_schur: ApproxSchurConfig | None
-    dense_threshold: int
+    @property
+    def approx_chol(self) -> ApproxCholConfig: ...
+    @property
+    def schur(self) -> Schur: ...
+    @property
+    def dense_threshold(self) -> int: ...
+    @property
+    def scaling(self) -> ScalingConfig: ...
+    @property
+    def ridge(self) -> float: ...
     def __init__(
         self,
         approx_chol: ApproxCholConfig | None = None,
-        approx_schur: ApproxSchurConfig | None = None,
+        schur: Schur | None = None,
         dense_threshold: int | None = None,
-    ) -> None: ...
-
-class AdditiveSchwarz:
-    """Additive Schwarz preconditioner with configurable local solver."""
-
-    local_solver: LocalSolverConfig | None
-    reduction: ReductionStrategy
-    def __init__(
-        self,
-        local_solver: LocalSolverConfig | None = None,
-        reduction: ReductionStrategy = ReductionStrategy.Auto,
+        scaling: ScalingConfig | None = None,
+        ridge: float | None = None,
     ) -> None: ...

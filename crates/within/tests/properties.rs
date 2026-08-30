@@ -1,9 +1,19 @@
 use proptest::prelude::*;
-use within::{solve, LsmrOptions, Preconditioner};
+use within::{
+    solve, Channel, CoefficientAddress, Effect, LsmrOptions, Preconditioner, PreconditionerConfig,
+    Solver,
+};
 
 #[path = "common/property_strategies.rs"]
 mod strategies;
-use strategies::{additive_precond, random_fe_problem_strategy};
+use strategies::{additive_precond, random_fe_problem_strategy, random_slopes_problem_strategy};
+
+fn at(term: usize, level: usize, column: usize) -> CoefficientAddress {
+    CoefficientAddress {
+        channel: Channel { term, column },
+        level,
+    }
+}
 
 fn default_params() -> LsmrOptions {
     LsmrOptions::default()
@@ -37,8 +47,7 @@ proptest! {
 
     #[test]
     fn prop_solver_convergence((cats, y) in random_fe_problem_strategy()) {
-        // LSMR converges on the least-squares system min ||y - Dx||^2 for any
-        // y, so we use the random y directly from the strategy.
+        // LSMR converges on min ||y - Dx||^2 for any y, so the random y is used directly.
         let params = LsmrOptions {
             tol: 1e-7,
             ..default_params()
@@ -59,9 +68,7 @@ proptest! {
         let precond = additive_precond();
         let result = solve(cats.view(), &y, None, &params, &precond).unwrap();
 
-        if !result.converged {
-            return Ok(());
-        }
+        prop_assume!(result.converged);
 
         let n_obs = y.len();
         let n_factors = cats.ncols();
@@ -84,5 +91,89 @@ proptest! {
                 );
             }
         }
+    }
+
+    /// First-order optimality (the definition of a least-squares solution):
+    /// the returned coefficients solve `min ||√W (y − D x)||²` iff the residual
+    /// is design-orthogonal in the W-metric, `Dᵀ W (y − D x) = 0`. This is a
+    /// self-contained truth oracle — it verifies the coefficients against the
+    /// problem's own optimality condition, not against another solver. Holds
+    /// for rank-deficient designs too: unidentified directions lie in the
+    /// column span, so the residual is orthogonal to them as well.
+    #[test]
+    fn prop_slopes_normal_equations(problem in random_slopes_problem_strategy()) {
+        let factors = &problem.factors;
+        let weights = &problem.weights;
+        let y = &problem.y;
+        let n_obs = y.len();
+
+        let effects: Vec<Effect> = factors
+            .iter()
+            .map(|f| {
+                Effect::new(&f.levels, f.intercept, f.slopes.iter().map(Vec::as_slice))
+                    .expect("valid effect")
+            })
+            .collect();
+
+        // Non-converged draws are rejected, so proptest caps how many may be produced.
+        let params = LsmrOptions {
+            tol: 1e-10,
+            maxiter: 2000,
+            local_size: Some(10),
+        };
+        let result = Solver::new(effects, Some(weights.clone()), PreconditionerConfig::default())
+            .expect("build solver")
+            .solve(y.as_slice(), &params)
+            .expect("solve");
+        prop_assume!(result.converged);
+
+        // Reconstruct r = y − D x from the coefficients ALONE, sharing no code with within.
+        let x = &result.x;
+        let layout = &result.layout;
+        let mut fitted = vec![0.0f64; n_obs];
+        for (t, f) in factors.iter().enumerate() {
+            let slope_base = usize::from(f.intercept);
+            for i in 0..n_obs {
+                let lvl = f.levels[i] as usize;
+                if f.intercept {
+                    fitted[i] += x[layout.index(at(t, lvl, 0)).unwrap()];
+                }
+                for (s, col) in f.slopes.iter().enumerate() {
+                    fitted[i] += x[layout.index(at(t, lvl, slope_base + s)).unwrap()] * col[i];
+                }
+            }
+        }
+
+        // g = Dᵀ W (y − D x) must vanish relative to g0 = Dᵀ W y.
+        let mut g = vec![0.0f64; layout.n_dofs()];
+        let mut g0 = vec![0.0f64; layout.n_dofs()];
+        for (t, f) in factors.iter().enumerate() {
+            let slope_base = usize::from(f.intercept);
+            for i in 0..n_obs {
+                let lvl = f.levels[i] as usize;
+                let wr = weights[i] * (y[i] - fitted[i]);
+                let wy = weights[i] * y[i];
+                if f.intercept {
+                    let k = layout.index(at(t, lvl, 0)).unwrap();
+                    g[k] += wr;
+                    g0[k] += wy;
+                }
+                for (s, col) in f.slopes.iter().enumerate() {
+                    let k = layout.index(at(t, lvl, slope_base + s)).unwrap();
+                    g[k] += wr * col[i];
+                    g0[k] += wy * col[i];
+                }
+            }
+        }
+
+        let norm = |v: &[f64]| v.iter().map(|a| a * a).sum::<f64>().sqrt();
+        let rel = norm(&g) / norm(&g0).max(1e-12);
+        prop_assert!(
+            rel <= 1e-6,
+            "first-order optimality violated: ||DᵀW(y−Dx)|| / ||DᵀWy|| = {rel:.3e} \
+             (n_obs={n_obs}, n_terms={}, iters={})",
+            factors.len(),
+            result.iterations,
+        );
     }
 }

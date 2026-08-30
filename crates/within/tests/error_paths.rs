@@ -2,14 +2,20 @@ use std::error::Error;
 
 use ndarray::Array2;
 use schwarz_precond::SolveError;
-use within::observation::FactorMajorStore;
-use within::{solve, BuildError, Design, LsmrOptions, PreconditionerConfig, Solver, WithinError};
+use within::observation::ObservationFrame;
+use within::{
+    solve, solve_batch, BuildError, Design, Effect, LocalSolverConfig, LsmrOptions,
+    PreconditionerConfig, Solver, WithinError,
+};
+
+// The Display/source()/From plumbing has one wiring check per enum, not per message.
 
 #[test]
 fn test_empty_observations_error() {
-    // FactorMajorStore::new allows 0 rows; EmptyObservations is raised by Design::from_store
-    let store = FactorMajorStore::new(vec![vec![], vec![]], 0).expect("store ok");
-    let result = Design::from_store(store);
+    // A zero-row frame is valid; EmptyObservations is raised by Design::from_frame.
+    let frame =
+        ObservationFrame::new(vec![vec![].into(), vec![].into()], Vec::new()).expect("frame ok");
+    let result = Design::from_frame(frame);
     assert!(result.is_err());
     match result.unwrap_err() {
         BuildError::EmptyObservations => {}
@@ -20,7 +26,10 @@ fn test_empty_observations_error() {
 #[test]
 fn test_observation_count_mismatch_error() {
     // Factor columns have different lengths
-    let result = FactorMajorStore::new(vec![vec![0, 1, 2], vec![0, 1]], 3);
+    let result = ObservationFrame::new(
+        vec![vec![0u32, 1, 2].into(), vec![0u32, 1].into()],
+        Vec::new(),
+    );
     assert!(result.is_err());
     match result.unwrap_err() {
         BuildError::ObservationCountMismatch { .. } => {}
@@ -31,8 +40,12 @@ fn test_observation_count_mismatch_error() {
 #[test]
 fn test_weight_count_mismatch_error() {
     // Weights of wrong length are caught at Solver construction time.
-    let store = FactorMajorStore::new(vec![vec![0, 1, 2], vec![0, 1, 0]], 3).expect("store ok");
-    let design = Design::from_store(store).expect("valid design");
+    let frame = ObservationFrame::new(
+        vec![vec![0u32, 1, 2].into(), vec![0u32, 1, 0].into()],
+        Vec::new(),
+    )
+    .expect("frame ok");
+    let design = Design::from_frame(frame).expect("valid design");
     let result = Solver::new(design, Some(vec![1.0, 2.0]), None);
     let err = result.expect_err("expected WeightCountMismatch error, got Ok");
     match err {
@@ -58,177 +71,9 @@ fn test_empty_categories_via_solve() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Display tests for BuildError variants
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_build_error_display_empty_observations() {
-    let e = BuildError::EmptyObservations;
-    assert_eq!(e.to_string(), "no observations provided");
-}
-
-#[test]
-fn test_build_error_display_observation_count_mismatch() {
-    let e = BuildError::ObservationCountMismatch {
-        factor: 1,
-        expected: 10,
-        got: 5,
-    };
-    let s = e.to_string();
-    assert!(s.contains("factor 1"));
-    assert!(s.contains("5"));
-    assert!(s.contains("10"));
-}
-
-#[test]
-fn test_build_error_display_weight_count_mismatch() {
-    let e = BuildError::WeightCountMismatch {
-        expected: 10,
-        got: 5,
-    };
-    let s = e.to_string();
-    assert!(s.contains("5"));
-    assert!(s.contains("10"));
-}
-
-#[test]
-fn test_build_error_display_singular_diagonal() {
-    let e = BuildError::SingularDiagonal {
-        block: "test_block",
-        index: 42,
-    };
-    let s = e.to_string();
-    assert!(s.contains("test_block"));
-    assert!(s.contains("42"));
-}
-
-#[test]
-fn test_build_error_display_local_solver_build() {
-    let e = BuildError::LocalSolverBuild("factorization failed".to_string());
-    assert!(e.to_string().contains("factorization failed"));
-}
-
-#[test]
-fn test_build_error_display_preconditioner() {
-    let inner = schwarz_precond::BuildError::ScratchSizeTooSmall {
-        scratch_size: 1,
-        required_min: 2,
-    };
-    let e = BuildError::Preconditioner(inner);
-    let s = e.to_string();
-    assert!(s.contains("scratch size"));
-}
-
-// ---------------------------------------------------------------------------
-// Display tests for WithinError union
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_within_error_display_build() {
-    let e = WithinError::Build(BuildError::EmptyObservations);
-    assert_eq!(e.to_string(), "no observations provided");
-}
-
-#[test]
-fn test_within_error_display_solve() {
-    let inner = SolveError::Synchronization { context: "test" };
-    let e = WithinError::Solve(inner);
-    assert!(e.to_string().contains("test"));
-}
-
-// ---------------------------------------------------------------------------
-// Error::source() tests
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_build_error_source_leaf_variants_have_no_source() {
-    let variants: Vec<BuildError> = vec![
-        BuildError::EmptyObservations,
-        BuildError::ObservationCountMismatch {
-            factor: 0,
-            expected: 1,
-            got: 2,
-        },
-        BuildError::WeightCountMismatch {
-            expected: 1,
-            got: 2,
-        },
-        BuildError::SingularDiagonal {
-            block: "b",
-            index: 0,
-        },
-        BuildError::LocalSolverBuild("x".to_string()),
-    ];
-    for e in &variants {
-        assert!(e.source().is_none(), "expected None source for {:?}", e);
-    }
-}
-
-#[test]
-fn test_build_error_source_preconditioner_chains() {
-    let inner = schwarz_precond::BuildError::ScratchSizeTooSmall {
-        scratch_size: 1,
-        required_min: 2,
-    };
-    let e = BuildError::Preconditioner(inner);
-    assert!(e.source().is_some());
-}
-
-#[test]
-fn test_within_error_build_leaf_variant_has_no_source() {
-    // WithinError::Build is transparent, so source() forwards to the inner
-    // BuildError's source. A leaf variant has no underlying source.
-    let e = WithinError::Build(BuildError::EmptyObservations);
-    assert!(e.source().is_none());
-}
-
-#[test]
-fn test_within_error_build_preconditioner_chains_through_transparent_wrapper() {
-    // Transparent: WithinError -> (BuildError::Preconditioner via #[source]) -> schwarz_precond::BuildError
-    let inner = schwarz_precond::BuildError::ScratchSizeTooSmall {
-        scratch_size: 1,
-        required_min: 2,
-    };
-    let e = WithinError::Build(BuildError::Preconditioner(inner));
-    assert!(e.source().is_some());
-}
-
-#[test]
-fn test_within_error_solve_leaf_variant_has_no_source() {
-    let inner = SolveError::Synchronization { context: "test" };
-    let e = WithinError::Solve(inner);
-    assert!(e.source().is_none());
-}
-
-// ---------------------------------------------------------------------------
-// Convenience-wrapper From conversions
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_within_error_from_build_error() {
-    let inner = BuildError::EmptyObservations;
-    let e: WithinError = inner.into();
-    match e {
-        WithinError::Build(BuildError::EmptyObservations) => {}
-        other => panic!("expected Build(EmptyObservations), got: {:?}", other),
-    }
-}
-
-#[test]
-fn test_within_error_from_solve_error() {
-    let inner = SolveError::Synchronization { context: "test" };
-    let e: WithinError = inner.into();
-    match e {
-        WithinError::Solve(_) => {}
-        other => panic!("expected Solve, got: {:?}", other),
-    }
-}
-
 #[test]
 fn test_preconditioner_dimension_mismatch_error() {
-    // Build a preconditioner against a larger design, then try to reuse it
-    // with a smaller design — the dim check in Solver::new should fire.
+    // Reusing a larger design's preconditioner must trip the dim check in Solver::new.
     let big = Array2::from_shape_vec((4, 2), vec![0u32, 0, 1, 1, 2, 0, 3, 1]).expect("big array");
     let small = Array2::from_shape_vec((3, 2), vec![0u32, 0, 1, 1, 0, 0]).expect("small array");
 
@@ -254,13 +99,130 @@ fn test_preconditioner_dimension_mismatch_error() {
 }
 
 #[test]
-fn test_build_error_display_preconditioner_dimension_mismatch() {
-    let e = BuildError::PreconditionerDimensionMismatch {
-        expected: 7,
-        actual_rows: 5,
-        actual_cols: 5,
+fn test_non_finite_response_rejected() {
+    let cats = Array2::from_shape_vec((3, 1), vec![0u32, 1, 2]).expect("cats");
+    let params = LsmrOptions::default();
+    let precond = PreconditionerConfig::default();
+
+    let y = [1.0, f64::NAN, 3.0];
+    match solve(cats.view(), &y, None, &params, &precond).unwrap_err() {
+        WithinError::Solve(SolveError::InvalidInput { message, .. }) => {
+            assert!(
+                message.contains("index 1"),
+                "message names the index: {message}"
+            );
+        }
+        other => panic!("Expected Solve(InvalidInput) via solve(), got: {other:?}"),
+    }
+
+    // The persistent Solver API funnels through the same guard, so it cannot be bypassed.
+    let solver = Solver::new(cats.view(), None, &precond).expect("solver");
+    match solver.solve(&y, &params).unwrap_err() {
+        SolveError::InvalidInput { message, .. } => {
+            assert!(
+                message.contains("index 1"),
+                "message names the index: {message}"
+            );
+        }
+        other => panic!("Expected InvalidInput via Solver::solve(), got: {other:?}"),
+    }
+
+    // solve_batch funnels every column through Solver::solve; the bad value is in the 2nd RHS.
+    let good = [1.0, 2.0, 3.0];
+    let bad = [1.0, 2.0, f64::INFINITY];
+    match solve_batch(cats.view(), &[&good[..], &bad[..]], None, &params, &precond).unwrap_err() {
+        WithinError::Solve(SolveError::InvalidInput { message, .. }) => {
+            assert!(
+                message.contains("index 2"),
+                "message names the index: {message}"
+            );
+        }
+        other => panic!("Expected Solve(InvalidInput) via solve_batch(), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_collinear_finite_slope_is_unidentified_not_rejected() {
+    // A duplicated but FINITE slope is rank deficiency, not malformed input (#122).
+    let levels = [0u32, 0, 1, 1];
+    let z = [1.0, 3.0, 2.0, 5.0];
+    let y = [1.0, 2.0, 3.0, 4.0];
+    let effects = vec![Effect::new(&levels, true, [&z[..], &z[..]]).expect("effect")];
+    let params = LsmrOptions::default();
+    let precond = PreconditionerConfig::default();
+
+    let r = solve(effects, &y, None, &params, &precond).expect("collinear-but-finite must solve");
+    assert!(
+        !r.unidentified.is_empty(),
+        "a duplicated finite slope must report an unidentified direction"
+    );
+}
+
+#[test]
+fn test_solver_accepts_slope_bearing_design_alongside_other_terms() {
+    let levels = [0u32, 1, 0, 1];
+    let slope = [1.0, 2.0, 3.0, 4.0];
+    let effects = vec![
+        within::Effect::new(&levels, true, []).expect("plain effect"),
+        within::Effect::new(&levels, true, [&slope[..]]).expect("slope effect"),
+    ];
+    // Cross-factor routing (#61): slope terms alongside other terms build.
+    let design = Design::new(effects).expect("slope design builds");
+    Solver::new(design, None, None).expect("signed routing builds");
+}
+
+// One wiring check per enum: From conversions and the transparent source() forward.
+
+#[test]
+fn test_within_error_from_build_error() {
+    let inner = BuildError::EmptyObservations;
+    let e: WithinError = inner.into();
+    match e {
+        WithinError::Build(BuildError::EmptyObservations) => {}
+        other => panic!("expected Build(EmptyObservations), got: {:?}", other),
+    }
+}
+
+#[test]
+fn test_within_error_from_solve_error() {
+    let inner = SolveError::Synchronization { context: "test" };
+    let e: WithinError = inner.into();
+    match e {
+        WithinError::Solve(_) => {}
+        other => panic!("expected Solve, got: {:?}", other),
+    }
+}
+
+#[test]
+fn test_within_error_source_chains_through_transparent_wrapper() {
+    // Transparent: WithinError -> BuildError::Preconditioner -> schwarz_precond::BuildError
+    let inner = schwarz_precond::BuildError::ScratchSizeTooSmall {
+        scratch_size: 1,
+        required_min: 2,
     };
-    let s = e.to_string();
-    assert!(s.contains("7"));
-    assert!(s.contains("5"));
+    let e = WithinError::Build(BuildError::Preconditioner(inner));
+    assert!(e.source().is_some());
+}
+
+#[test]
+fn test_invalid_ridge_rejected() {
+    let f = [0u32, 0, 1, 1];
+    let g = [0u32, 1, 0, 1];
+    for ridge in [-1e-9, f64::NAN, f64::INFINITY] {
+        let precond = PreconditionerConfig::Additive {
+            local_solver: LocalSolverConfig {
+                ridge,
+                ..Default::default()
+            },
+            reduction: Default::default(),
+        };
+        let effects = vec![
+            Effect::new(&f, true, []).expect("f"),
+            Effect::new(&g, true, []).expect("g"),
+        ];
+        match Solver::new(effects, None, &precond) {
+            Err(BuildError::InvalidRidge { value }) => assert_eq!(value.to_bits(), ridge.to_bits()),
+            other => panic!("expected InvalidRidge for {ridge}, got {other:?}"),
+        }
+    }
 }

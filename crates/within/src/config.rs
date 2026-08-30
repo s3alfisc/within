@@ -3,17 +3,26 @@
 //! `Option<&PreconditionerConfig>` accepts `None` (default Additive Schwarz),
 //! `Some(Off)` (identity), `Some(Additive(_))` (tuned), or
 //! `Some(Diagonal)` (Jacobi).
+//!
+//! Stability policy: enums that may gain variants (the preconditioner strategy
+//! set) stay `#[non_exhaustive]`, so adding a variant is non-breaking — external
+//! `match` sites already carry a wildcard arm. Option structs commit to public
+//! fields and literal construction; adding a field is a deliberate breaking
+//! change, caught mechanically by the cargo-semver-checks CI gate rather than
+//! slipping through silently.
+
+use serde::{Deserialize, Serialize};
 
 pub use schwarz_precond::ReductionStrategy;
 
-/// Default `n_keep` threshold for dense Schur fast-path factorization.
-///
-/// Schur domains with `min(n_q, n_r) <= threshold` will first try dense
-/// anchored Cholesky before falling back to sparse ApproxChol.
+/// Default `n_keep` threshold below which a Schur domain tries the exact dense backend.
 pub(crate) const DEFAULT_DENSE_SCHUR_THRESHOLD: usize = 24;
 
+/// Default spectral floor; centred between the measured failure cliff (1e-13) and iteration cost (1e-7).
+pub(crate) const DEFAULT_SLOPE_PAIR_RIDGE: f64 = 1e-10;
+
 /// Configuration for approximate Cholesky factorization.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApproxCholConfig {
     /// Random seed for the factorization sampler.
     pub seed: u64,
@@ -22,39 +31,51 @@ pub struct ApproxCholConfig {
 }
 
 impl ApproxCholConfig {
-    pub(crate) fn to_approx_chol(self) -> approx_chol::Config {
+    pub(crate) fn to_approx_chol(
+        self,
+        exact_below: usize,
+        on_failure: approx_chol::ExactFailure,
+    ) -> approx_chol::Config {
         approx_chol::Config {
             seed: self.seed,
             split_merge: self.split_merge,
+            // `max_dim: 0` claims no block, which is what `dense_threshold: 0` asks for.
+            backend: approx_chol::Backend::ExactBelow {
+                max_dim: exact_below,
+                on_failure,
+            },
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Local solver configuration
-// ---------------------------------------------------------------------------
+/// Schur reduction mode: sampled bounds per-subdomain cost, exact trades speed for fidelity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum SchurMode {
+    /// Approximate Schur via clique-tree sampling.
+    Approximate(ApproxSchurConfig),
+    /// Exact Schur complement.
+    Exact,
+}
+
+impl Default for SchurMode {
+    fn default() -> Self {
+        SchurMode::Approximate(ApproxSchurConfig::default())
+    }
+}
 
 /// Local solver configuration for Schwarz subdomains.
-///
-/// Uses Schur complement reduction: eliminates the larger diagonal block
-/// (exactly or approximately), then factorizes the smaller reduced system.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LocalSolverConfig {
     /// ApproxChol config for the reduced system.
     pub approx_chol: ApproxCholConfig,
-    /// Approximate Schur complement configuration.
-    ///
-    /// `Some(ApproxSchurConfig::default())` is the library default — approximate
-    /// Schur with clique-tree sampling, which keeps per-subdomain factorization
-    /// cost bounded under the iterative-solver context. `None` requests an
-    /// exact Schur complement, used by tests and by callers who specifically
-    /// want the higher-fidelity factorization.
-    pub approx_schur: Option<ApproxSchurConfig>,
-    /// Dense Schur fast-path threshold on reduced size `n_keep=min(n_q,n_r)`.
-    ///
-    /// `0` disables the dense fast path; larger values allow dense anchored
-    /// Cholesky for more subdomains.
+    /// Schur-complement reduction mode (default: approximate).
+    pub schur: SchurMode,
+    /// Reduced-size threshold at or below which fill-in is affordable; `0` disables.
     pub dense_threshold: usize,
+    /// Certification policy for the diagonal scaling of signed components.
+    pub scaling: ScalingConfig,
+    /// Spectral floor on grounded signed components, as a fraction of the largest diagonal; `0` off.
+    pub ridge: f64,
 }
 
 impl Default for LocalSolverConfig {
@@ -64,34 +85,50 @@ impl Default for LocalSolverConfig {
                 seed: 0,
                 split_merge: Some(2),
             },
-            approx_schur: Some(ApproxSchurConfig::default()),
+            schur: SchurMode::default(),
             dense_threshold: DEFAULT_DENSE_SCHUR_THRESHOLD,
+            scaling: ScalingConfig::default(),
+            ridge: DEFAULT_SLOPE_PAIR_RIDGE,
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Approximate Schur complement configuration
-// ---------------------------------------------------------------------------
+/// Frustration is always a hard error; this governs only the dominance certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ScalingConfig {
+    /// Relative slack for weak dominance; PSD-boundary designs hover at ≈ 1e-12.
+    pub tolerance: f64,
+    /// Reduced-CG iteration budget; each iteration costs 2–4 matrix-vector passes.
+    pub max_iterations: usize,
+    /// Disposition when certification fails.
+    pub on_failure: ScalingFailure,
+}
 
-/// Configuration for approximate Schur complement via clique-tree sampling.
-///
-/// Every eliminated vertex uses a sampled spanning tree (at most deg-1 fill
-/// edges) via the GKS 2023 Algorithm 3 clique-tree. This preserves spectral
-/// quality (unbiased edge weights) while reducing fill-in to O(deg).
-///
-/// When `split > 1`, each edge in the star is split into `split` parallel
-/// copies (each carrying `1/split` of the original weight) before sampling
-/// the clique-tree. This produces up to `split * (deg-1)` fill edges,
-/// giving a denser (better) Schur approximation at the cost of more fill-in.
-#[derive(Debug, Clone, Copy)]
+/// What to do when a component's dominance scaling cannot be certified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScalingFailure {
+    /// Clamp residual deficits and record a [`BuildWarning`](crate::BuildWarning).
+    Warn,
+    /// Fail with [`BuildError::UnscalableComponent`](crate::BuildError::UnscalableComponent).
+    Error,
+}
+
+impl Default for ScalingConfig {
+    fn default() -> Self {
+        Self {
+            tolerance: 1e-9,
+            max_iterations: 2048,
+            on_failure: ScalingFailure::Warn,
+        }
+    }
+}
+
+/// Approximate Schur via GKS 2023 Algorithm 3: unbiased edge weights at O(deg) fill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApproxSchurConfig {
     /// Random seed for the clique-tree sampler.
     pub seed: u64,
-    /// Edge split factor: each star edge is split into `split` copies
-    /// before clique-tree sampling.
-    ///
-    /// `1` = no splitting (standard), `k > 1` = denser approximation.
+    /// Star-edge split factor: `1` is standard, `k > 1` a denser approximation at more fill-in.
     pub split: u32,
 }
 
@@ -101,14 +138,8 @@ impl Default for ApproxSchurConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Preconditioner configuration
-// ---------------------------------------------------------------------------
-
-/// Preconditioner variant.
-///
-/// `#[non_exhaustive]` — external `match` sites must include a wildcard arm.
-#[derive(Debug, Clone)]
+/// Preconditioner variant. `#[non_exhaustive]`, so external `match` sites need a wildcard arm.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum PreconditionerConfig {
     /// Identity preconditioner. Solves the unpreconditioned normal equations.
@@ -120,11 +151,7 @@ pub enum PreconditionerConfig {
         /// Strategy for combining overlapping subdomain contributions.
         reduction: ReductionStrategy,
     },
-    /// Diagonal/Jacobi preconditioner with `M^{-1} = diag(D^T W D)^{-1}`.
-    ///
-    /// A level with no observations (or one that is fully zero-weighted) has a
-    /// zero diagonal; it takes the pseudo-inverse (`inv = 0`), pinning that
-    /// coordinate to 0 as on the unpreconditioned path.
+    /// Diagonal/Jacobi; a zero diagonal takes the pseudo-inverse, pinning that coordinate to 0.
     Diagonal,
 }
 
@@ -137,10 +164,6 @@ impl Default for PreconditionerConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// LSMR configuration
-// ---------------------------------------------------------------------------
-
 /// LSMR solver configuration: tolerances and reorthogonalization window.
 #[derive(Debug, Clone)]
 pub struct LsmrOptions {
@@ -148,13 +171,7 @@ pub struct LsmrOptions {
     pub tol: f64,
     /// Maximum LSMR iterations before declaring non-convergence.
     pub maxiter: usize,
-    /// Number of past `v` vectors to reorthogonalize against via windowed
-    /// modified Gram-Schmidt. `None` (default) disables — the plain short
-    /// recurrence is used. `Some(N)` enables a window of `N` past vectors;
-    /// `Some(5..20)` is cheap insurance for ill-conditioned problems where
-    /// rounding causes the bidiagonalization to lose orthogonality and
-    /// convergence to stall. Memory cost is `local_size · n` doubles
-    /// unpreconditioned, `2·local_size · n` preconditioned.
+    /// Window of past `v` vectors for windowed MGS; `None` disables. Costs `local_size · n`.
     pub local_size: Option<usize>,
 }
 

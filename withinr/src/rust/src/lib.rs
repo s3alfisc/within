@@ -20,4 +20,5 @@ extendr_module! {
     mod withinr;
     use api;
     use config;
+    use results;
 }

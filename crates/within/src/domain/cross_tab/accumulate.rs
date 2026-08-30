@@ -1,174 +1,245 @@
 //! Observation accumulation kernels for [`CrossTab`](super::CrossTab) construction.
 //!
 //! Both the dense and sparse paths scan observations once, decoding each into
-//! its compact `(cj, ck, weight)` via [`decode_obs`], and accumulate the
-//! cross-tabulation block `C` plus the two diagonals.
+//! its compact [`Contribution`] via [`PairColumns::decode`]: `w·l_row·l_col` to its
+//! cell and `w·l_row²` / `w·l_col²` to the diagonals, where `l` is the channel's
+//! loading, so slope channels yield signed cells. Paths are generic over
+//! [`Loading`] and monomorphized per pair: intercept channels pass [`Unit`],
+//! whose `l ≡ 1` folds the loading math away, so plain pairs keep the
+//! pre-slope codegen.
 
+use crate::channel::ChannelPair;
 use crate::csr_block::CsrBlock;
 use crate::domain::Design;
-use crate::observation::{factor_columns, level_at, Store};
 
 use super::{to_u32, ActiveLevels};
+use crate::domain::Loading as ColumnLoading;
 
-/// Max entries in a flat dense cross-tab accumulator (~40 MB at 8 bytes each).
-/// Absolute hard cap on the dense path: tables larger than this always go
-/// sparse, regardless of the cost comparison in `accumulate_cross_block`.
+/// Hard cap on the dense accumulator (~40 MB); larger tables always go sparse.
 const DENSE_TABLE_MAX_ENTRIES: usize = 5_000_000;
 
-/// Decode observation `uid` into its compact `(cj, ck, weight)`, or `None` if
-/// either factor level is inactive (compact index `u32::MAX`) and the
-/// observation should be skipped.
-#[inline]
-fn decode_obs<S: Store>(
-    design: &Design<S>,
-    weights: Option<&[f64]>,
-    cols: &[Option<&[u32]>],
-    q: usize,
-    r: usize,
-    active: &ActiveLevels,
-    uid: usize,
-) -> Option<(u32, u32, f64)> {
-    let j = level_at(&design.store, cols[q], uid, q);
-    let k = level_at(&design.store, cols[r], uid, r);
-    let cj = active.q_map[j];
-    let ck = active.r_map[k];
-    if cj == u32::MAX || ck == u32::MAX {
-        return None;
-    }
-    let w = weights.map_or(1.0, |w| w[uid]);
-    Some((cj, ck, w))
+/// A channel's per-observation loading.
+pub(super) trait Loading: Copy {
+    fn at(self, uid: usize) -> f64;
 }
 
-/// Accumulate observation weights into a cross-tabulation block C plus diagonals.
-///
-/// Used by `CrossTab::build_for_pair_with_active`. Observations whose compact
-/// index is `u32::MAX` are skipped.
-///
-/// Dispatches to a dense or sparse path by comparing their estimated peak
-/// transient memory, with a hard dense-table ceiling.
-pub(super) fn accumulate_cross_block<S: Store>(
-    design: &Design<S>,
+/// Intercept loading `l ≡ 1`; LLVM folds the resulting `x · 1.0` away.
+#[derive(Clone, Copy)]
+pub(super) struct Unit;
+
+impl Loading for Unit {
+    #[inline]
+    fn at(self, _uid: usize) -> f64 {
+        1.0
+    }
+}
+
+impl Loading for &[f64] {
+    #[inline]
+    fn at(self, uid: usize) -> f64 {
+        self[uid]
+    }
+}
+
+/// One observation's Gram contribution: signed cell `w·l_row·l_col` plus its diagonals.
+struct Contribution {
+    cj: usize,
+    ck: usize,
+    cell: f64,
+    row_diag: f64,
+    col_diag: f64,
+}
+
+/// Per-observation input columns backing one channel pair: level codes, loadings, and weights.
+#[derive(Clone, Copy)]
+pub(super) struct PairColumns<'a, Lq: Loading, Lr: Loading> {
+    pub(super) row_levels: &'a [u32],
+    pub(super) col_levels: &'a [u32],
+    pub(super) row_load: Lq,
+    pub(super) col_load: Lr,
+    pub(super) weights: Option<&'a [f64]>,
+}
+
+impl<Lq: Loading, Lr: Loading> PairColumns<'_, Lq, Lr> {
+    /// `None` when either level is inactive, so the observation is skipped.
+    #[inline]
+    fn decode(&self, active: &ActiveLevels, uid: usize) -> Option<Contribution> {
+        let cj = active.row_map[self.row_levels[uid] as usize];
+        let ck = active.col_map[self.col_levels[uid] as usize];
+        if cj == u32::MAX || ck == u32::MAX {
+            return None;
+        }
+        let w = self.weights.map_or(1.0, |w| w[uid]);
+        let l_row = self.row_load.at(uid);
+        let l_col = self.col_load.at(uid);
+        Some(Contribution {
+            cj: cj as usize,
+            ck: ck as usize,
+            cell: w * l_row * l_col,
+            row_diag: w * l_row * l_row,
+            col_diag: w * l_col * l_col,
+        })
+    }
+}
+
+/// Accumulate into `C` plus diagonals, dispatching dense or sparse by peak transient memory.
+pub(super) fn accumulate_cross_block(
+    design: &Design<'_>,
     weights: Option<&[f64]>,
-    q: usize,
-    r: usize,
+    pair: ChannelPair,
     active: &ActiveLevels,
 ) -> (CsrBlock, Vec<f64>, Vec<f64>) {
-    // Cost-based dispatch. Both paths produce a bit-identical CSR `C`, `diag_q`,
-    // and `diag_r`; only their peak transient allocation differs:
-    //   - dense path: a flat `n_q * n_r` f64 table -> ~8 * n_q * n_r bytes;
-    //   - sparse path: per-observation buckets of (u32 col, f64 weight) sized
-    //     by valid observations (approximated by n_obs) -> ~12 * n_obs bytes.
-    // Picking sparse purely on cell count makes the sparse path use MORE memory
-    // than the dense table it replaces whenever n_obs >> cells. So use the dense
-    // table unconditionally up to `DENSE_TABLE_MAX_ENTRIES` (for small tables
-    // memory is a non-issue and the flat table is the faster build); only past
-    // that cap do we consider sparse, and even then only when its bucket cost is
-    // actually below the dense table cost -- otherwise the large-n_obs blowup
-    // this guards against would make sparse the *more* expensive choice, so we
-    // keep dense. Saturating math keeps the comparison well-defined even for
-    // enormous level counts.
-    let table_size = active.n_q.saturating_mul(active.n_r);
+    // Dispatching on cell count alone would pick sparse where it uses MORE memory.
+    let table_size = active.n_rows.saturating_mul(active.n_cols);
     let dense_cost = table_size.saturating_mul(8);
-    let sparse_cost = design.store.n_obs().saturating_mul(12);
+    let sparse_cost = design.n_obs.saturating_mul(12);
     let go_sparse = table_size > DENSE_TABLE_MAX_ENTRIES && sparse_cost < dense_cost;
+
+    let row_levels = design.frame.level_column(pair.rows.term);
+    let col_levels = design.frame.level_column(pair.cols.term);
+    let load = |col: ColumnLoading<u32>| {
+        col.covariate()
+            .map(|&c| design.frame.loading_column(c as usize))
+    };
+    // One arm per loading combination; closures aren't generic, so the literals repeat.
+    match (
+        load(design.loading(pair.rows)),
+        load(design.loading(pair.cols)),
+    ) {
+        (None, None) => accumulate(
+            PairColumns {
+                row_levels,
+                col_levels,
+                row_load: Unit,
+                col_load: Unit,
+                weights,
+            },
+            active,
+            go_sparse,
+        ),
+        (Some(zq), None) => accumulate(
+            PairColumns {
+                row_levels,
+                col_levels,
+                row_load: zq,
+                col_load: Unit,
+                weights,
+            },
+            active,
+            go_sparse,
+        ),
+        (None, Some(zr)) => accumulate(
+            PairColumns {
+                row_levels,
+                col_levels,
+                row_load: Unit,
+                col_load: zr,
+                weights,
+            },
+            active,
+            go_sparse,
+        ),
+        (Some(zq), Some(zr)) => accumulate(
+            PairColumns {
+                row_levels,
+                col_levels,
+                row_load: zq,
+                col_load: zr,
+                weights,
+            },
+            active,
+            go_sparse,
+        ),
+    }
+}
+
+/// Size-dispatched accumulation for one monomorphized loading combination.
+fn accumulate<Lq: Loading, Lr: Loading>(
+    cols: PairColumns<'_, Lq, Lr>,
+    active: &ActiveLevels,
+    go_sparse: bool,
+) -> (CsrBlock, Vec<f64>, Vec<f64>) {
     if go_sparse {
-        accumulate_sparse_cross_block(design, weights, q, r, active)
+        accumulate_sparse_cross_block(cols, active)
     } else {
-        accumulate_dense_cross_block(design, weights, q, r, active)
+        accumulate_dense_cross_block(cols, active)
     }
 }
 
-/// Dense path: flat `n_q * n_r` table with O(1) accumulation per observation.
-fn accumulate_dense_cross_block<S: Store>(
-    design: &Design<S>,
-    weights: Option<&[f64]>,
-    q: usize,
-    r: usize,
+/// Dense path: flat `n_rows * n_cols` table with O(1) accumulation per observation.
+pub(super) fn accumulate_dense_cross_block<Lq: Loading, Lr: Loading>(
+    cols: PairColumns<'_, Lq, Lr>,
     active: &ActiveLevels,
 ) -> (CsrBlock, Vec<f64>, Vec<f64>) {
-    let n_obs = design.store.n_obs();
-    let n_q = active.n_q;
-    let n_r = active.n_r;
-    let cols = factor_columns(&design.store);
-    let mut diag_q = vec![0.0f64; n_q];
-    let mut diag_r = vec![0.0f64; n_r];
-    let mut table = vec![0.0f64; n_q * n_r];
+    let n_obs = cols.row_levels.len();
+    let n_rows = active.n_rows;
+    let n_cols = active.n_cols;
+    let mut row_diag = vec![0.0f64; n_rows];
+    let mut col_diag = vec![0.0f64; n_cols];
+    let mut table = vec![0.0f64; n_rows * n_cols];
 
     for uid in 0..n_obs {
-        let Some((cj, ck, w)) = decode_obs(design, weights, &cols, q, r, active, uid) else {
+        let Some(o) = cols.decode(active, uid) else {
             continue;
         };
-        debug_assert!((cj as usize) < n_q && (ck as usize) < n_r);
-        diag_q[cj as usize] += w;
-        diag_r[ck as usize] += w;
-        table[cj as usize * n_r + ck as usize] += w;
+        debug_assert!(o.cj < n_rows && o.ck < n_cols);
+        row_diag[o.cj] += o.row_diag;
+        col_diag[o.ck] += o.col_diag;
+        table[o.cj * n_cols + o.ck] += o.cell;
     }
 
-    let c = CsrBlock::from_dense_table(&table, n_q, n_r);
-    (c, diag_q, diag_r)
+    let c = CsrBlock::from_dense_table(&table, n_rows, n_cols);
+    (c, row_diag, col_diag)
 }
 
-/// Sparse path: two-pass bucket + workspace-based dedup per row.
-///
-/// Bucket observations by row in two passes (count + fill), then use
-/// a dense workspace of size n_r to accumulate and deduplicate each
-/// row. The workspace sort is on unique columns only (n_r_active << len).
-fn accumulate_sparse_cross_block<S: Store>(
-    design: &Design<S>,
-    weights: Option<&[f64]>,
-    q: usize,
-    r: usize,
+/// Sparse path: bucket by row, then dedup each row through a dense `n_cols` workspace.
+pub(super) fn accumulate_sparse_cross_block<Lq: Loading, Lr: Loading>(
+    cols: PairColumns<'_, Lq, Lr>,
     active: &ActiveLevels,
 ) -> (CsrBlock, Vec<f64>, Vec<f64>) {
-    let n_obs = design.store.n_obs();
-    let n_q = active.n_q;
-    let n_r = active.n_r;
-    let cols = factor_columns(&design.store);
-    let mut diag_q = vec![0.0f64; n_q];
-    let mut diag_r = vec![0.0f64; n_r];
+    let n_obs = cols.row_levels.len();
+    let n_rows = active.n_rows;
+    let n_cols = active.n_cols;
+    let mut row_diag = vec![0.0f64; n_rows];
+    let mut col_diag = vec![0.0f64; n_cols];
 
-    // Pass 1: accumulate diags + count entries per row
-    let mut row_counts = vec![0u32; n_q];
+    let mut row_counts = vec![0u32; n_rows];
     for uid in 0..n_obs {
-        let Some((cj, ck, w)) = decode_obs(design, weights, &cols, q, r, active, uid) else {
+        let Some(o) = cols.decode(active, uid) else {
             continue;
         };
-        diag_q[cj as usize] += w;
-        diag_r[ck as usize] += w;
-        row_counts[cj as usize] += 1;
+        row_diag[o.cj] += o.row_diag;
+        col_diag[o.ck] += o.col_diag;
+        row_counts[o.cj] += 1;
     }
 
-    // Build row-pointer array for the unsorted bucket CSR
-    let mut bucket_indptr = vec![0u32; n_q + 1];
-    for i in 0..n_q {
+    let mut bucket_indptr = vec![0u32; n_rows + 1];
+    for i in 0..n_rows {
         bucket_indptr[i + 1] = bucket_indptr[i] + row_counts[i];
     }
-    let total_entries = bucket_indptr[n_q] as usize;
+    let total_entries = bucket_indptr[n_rows] as usize;
 
-    // Pass 2: fill per-row buckets (col + weight only, no row index)
     let mut bucket_cols = vec![0u32; total_entries];
     let mut bucket_vals = vec![0.0f64; total_entries];
-    let mut cursor = bucket_indptr[..n_q].to_vec();
+    let mut cursor = bucket_indptr[..n_rows].to_vec();
     for uid in 0..n_obs {
-        let Some((cj, ck, w)) = decode_obs(design, weights, &cols, q, r, active, uid) else {
+        let Some(o) = cols.decode(active, uid) else {
             continue;
         };
-        let pos = cursor[cj as usize] as usize;
-        bucket_cols[pos] = ck;
-        bucket_vals[pos] = w;
-        cursor[cj as usize] += 1;
+        let pos = cursor[o.cj] as usize;
+        bucket_cols[pos] = to_u32(o.ck);
+        bucket_vals[pos] = o.cell;
+        cursor[o.cj] += 1;
     }
 
-    // Pass 3: workspace-based dedup per row.
-    // Accumulate into work[col], track touched columns, sort only the
-    // unique set, then emit into final CSR.
-    let mut work = vec![0.0f64; n_r];
+    // A signed cell cancelling to 0.0 mid-row re-pushes its column; the duplicate is harmless.
+    let mut work = vec![0.0f64; n_cols];
     let mut touched: Vec<u32> = Vec::new();
-    let mut c_indptr = vec![0u32; n_q + 1];
+    let mut c_indptr = vec![0u32; n_rows + 1];
     let mut c_indices = Vec::new();
     let mut c_data = Vec::new();
 
-    for row in 0..n_q {
+    for row in 0..n_rows {
         let start = bucket_indptr[row] as usize;
         let end = bucket_indptr[row + 1] as usize;
         for idx in start..end {
@@ -195,8 +266,8 @@ fn accumulate_sparse_cross_block<S: Store>(
         indptr: c_indptr,
         indices: c_indices,
         data: c_data,
-        nrows: n_q,
-        ncols: n_r,
+        nrows: n_rows,
+        ncols: n_cols,
     };
-    (c, diag_q, diag_r)
+    (c, row_diag, col_diag)
 }

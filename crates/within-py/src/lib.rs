@@ -1,10 +1,13 @@
-// __reduce__ methods return noisy PyO3 tuple types; allow the lint crate-wide.
+// `__reduce__` methods return noisy PyO3 tuple types; allow the lint crate-wide.
 #![allow(clippy::type_complexity)]
 
 //! Thin PyO3 bridge exposing the [`within`] crate to Python as `within._within`.
 //! Converts Python/numpy types to the native API and delegates all computation
-//! to [`within`]; every heavy call releases the GIL via [`Python::allow_threads`].
+//! to [`within`]; every heavy call detaches from the interpreter via [`Python::detach`].
 //! Usage docs live in `python/within/` and the `within._within.pyi` stub.
+//!
+//! `gil_used = false`: no `&mut self`, no global state; numpy inputs are read in place.
+//! Callers must not mutate an array from another thread while a call reads it.
 
 use pyo3::prelude::*;
 
@@ -13,30 +16,30 @@ mod config;
 mod convert;
 mod results;
 
-use api::{solve, solve_batch, PySolver};
+use api::{solve, solve_batch, PyEffect, PySolver};
 use config::{
-    PyAdditiveSchwarz, PyApproxCholConfig, PyApproxSchurConfig, PyLocalSolverConfig, PyLsmrOptions,
-    PyPreconditioner, PyPreconditionerConfig, PyReductionStrategy,
+    PyApproxCholConfig, PyApproxSchurConfig, PyLocalSolverConfig, PyLsmrOptions, PyPreconditioner,
+    PyPreconditionerConfig, PyReductionStrategy, PyScalingConfig, PySchur,
 };
-use results::{PyBatchSolveResult, PySolveResult};
+use results::{PyBatchSolveResult, PyCoefficientLayout, PySolveResult, PyUnidentifiedDirection};
 
-// ---------------------------------------------------------------------------
-// Module
-// ---------------------------------------------------------------------------
-
-#[pymodule]
+#[pymodule(gil_used = false)]
 fn _within(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySolveResult>()?;
     m.add_class::<PyBatchSolveResult>()?;
+    m.add_class::<PyUnidentifiedDirection>()?;
+    m.add_class::<PyCoefficientLayout>()?;
     m.add_class::<PyLsmrOptions>()?;
-    m.add_class::<PyAdditiveSchwarz>()?;
     m.add_class::<PyReductionStrategy>()?;
     m.add_class::<PyPreconditionerConfig>()?;
     m.add_class::<PyApproxCholConfig>()?;
     m.add_class::<PyApproxSchurConfig>()?;
     m.add_class::<PyLocalSolverConfig>()?;
+    m.add_class::<PyScalingConfig>()?;
+    m.add_class::<PySchur>()?;
     m.add_class::<PyPreconditioner>()?;
     m.add_class::<PySolver>()?;
+    m.add_class::<PyEffect>()?;
     m.add_function(wrap_pyfunction!(solve, m)?)?;
     m.add_function(wrap_pyfunction!(solve_batch, m)?)?;
     Ok(())

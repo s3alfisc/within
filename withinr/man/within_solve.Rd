@@ -5,7 +5,7 @@
 \title{Solve fixed-effects normal equations}
 \usage{
 within_solve(
-  categories,
+  design,
   y,
   options = NULL,
   weights = NULL,
@@ -13,9 +13,8 @@ within_solve(
 )
 }
 \arguments{
-\item{categories}{Integer matrix of shape \verb{(n_obs, n_factors)}. Each column
-contains \strong{1-based} factor level assignments. Values must be positive
-integers with no \code{NA}s.}
+\item{design}{Either an integer category matrix of shape
+\verb{(n_obs, n_factors)} with 1-based labels, or a list of \code{\link[=Effect]{Effect()}} terms.}
 
 \item{y}{Numeric vector of length \code{n_obs}.}
 
@@ -31,11 +30,12 @@ accepted: \code{NULL} builds the default additive Schwarz preconditioner,
 built \code{\link[=Preconditioner]{Preconditioner()}} object reuses an existing factorization.}
 }
 \value{
-A named list with fields \code{x}, \code{demeaned}, \code{converged},
-\code{iterations}, \code{residual}, \code{time_total}, \code{time_setup}, and \code{time_solve}.
+A named list with fields \code{x}, \code{unidentified}, \code{warnings},
+\code{layout}, \code{demeaned}, \code{converged}, \code{iterations},
+\code{residual}, \code{time_total}, \code{time_setup}, and \code{time_solve}.
 }
 \description{
 Computes fixed-effect coefficients by solving the normal equations
 \eqn{D^T W D x = D^T W y} where \eqn{D} is the dummy-variable design
-matrix implied by \code{categories} and \eqn{W} is the diagonal weight matrix.
+matrix implied by \code{design} and \eqn{W} is the diagonal weight matrix.
 }

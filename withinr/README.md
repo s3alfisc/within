@@ -22,11 +22,17 @@ NOT_CRAN=true R CMD INSTALL withinr
 
 ## API
 
-R category matrices are 1-based. Each column is one fixed-effect factor, and `withinr` converts values to the 0-based indices used by Rust.
+R category matrices use 1-based factor labels. A design can also be a list of
+`Effect()` terms for varying slopes.
 
 ```r
-within_solve(categories, y, options = NULL, weights = NULL, preconditioner = NULL)
-within_solve_batch(categories, Y, options = NULL, weights = NULL, preconditioner = NULL)
+within_solve(design, y, options = NULL, weights = NULL, preconditioner = NULL)
+within_solve_batch(design, Y, options = NULL, weights = NULL, preconditioner = NULL)
+
+varying_slopes <- list(
+  Effect(firm, slopes = x),
+  Effect(year)
+)
 ```
 
 The one-shot entry points carry a `within_` prefix (unlike Python's
@@ -37,7 +43,12 @@ mask `base::solve()`.
 
 `preconditioner` accepts `NULL`, `PreconditionerConfig$Additive`, `PreconditionerConfig$Off`, `PreconditionerConfig$Diagonal`, `AdditiveSchwarz(...)`, or a built `Preconditioner` returned by a persistent solver.
 
-Both solve functions return lists with `x`, `demeaned`, `converged`, `iterations`, `residual`, and timing fields. In batch results, `x` and `demeaned` are matrices with one column per right-hand side.
+Both solve functions return lists with `x`, `unidentified`, `warnings`,
+`layout`, `demeaned`, convergence diagnostics, and timing fields. In batch
+results, `x` and `demeaned` are matrices with one column per right-hand side.
+The lazy `layout` handle provides `$index(term, level, column)`,
+`$address(index)`, `$n_levels(term)`, and `$n_columns(term)` using R's 1-based
+indices and labels without materializing one address per coefficient.
 
 ## Example
 
@@ -79,6 +90,8 @@ b <- solver$solve_batch(cbind(y, X), options = LsmrOptions(tol = 1e-10))
 
 precond <- solver$preconditioner()
 print(precond) # Preconditioner(Additive, n=...)
+precond$config
+precond$build_duration_seconds
 
 payload <- precond$serialize()
 precond2 <- Preconditioner(payload)
@@ -91,8 +104,10 @@ solver2 <- Solver(categories, preconditioner = precond2)
 schwarz <- AdditiveSchwarz(
   local_solver = LocalSolverConfig(
     approx_chol = ApproxCholConfig(seed = 1, split_merge = 2L),
-    approx_schur = ApproxSchurConfig(seed = 1, split = 1L),
-    dense_threshold = 24L
+    schur = Schur$Approximate(ApproxSchurConfig(seed = 1, split = 1L)),
+    dense_threshold = 24L,
+    scaling = ScalingConfig(on_failure = ScalingFailure$Warn),
+    ridge = 1e-10
   ),
   reduction = ReductionStrategy$Auto
 )
@@ -100,7 +115,8 @@ schwarz <- AdditiveSchwarz(
 res <- within_solve(categories, y, preconditioner = schwarz)
 ```
 
-Passing `approx_schur = NULL` to `LocalSolverConfig()` requests exact Schur complements; omitting it uses the library-default approximate Schur configuration.
+Pass `schur = Schur$Exact` for exact Schur complements; omitting `schur` uses
+the library-default approximate configuration.
 
 ## CRAN / Offline Packaging
 

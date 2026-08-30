@@ -7,19 +7,130 @@ import pytest
 
 from within import (
     BatchSolveResult,
+    CoefficientLayout,
+    Effect,
     LsmrOptions,
     Preconditioner,
     PreconditionerConfig,
     Solver,
     solve,
 )
-from within.config import AdditiveSchwarz
+from within.config import LocalSolverConfig, ScalingConfig
 
-from conftest import generate_synthetic_data
+from conftest import as_solver_categories, generate_synthetic_data
 
 
-def as_solver_categories(cats):
-    return np.asfortranarray(np.column_stack(cats).astype(np.uint32))
+def assert_normal_equations_satisfied(cats, y, result, tol, weights=None):
+    """Independent optimality oracle for a categorical fixed-effects design.
+
+    Recomputes the relative normal-equation residual
+    ``||D^T W (y - Dx)|| / ||D^T W y||`` from ``result.demeaned`` (``y - Dx``,
+    produced separately from the LSMR recurrence) and the raw categories. Unlike
+    ``result.residual`` -- now the solver's own stopping estimate -- this cannot
+    be satisfied by the solver merely reporting convergence.
+    """
+    y = np.asarray(y, dtype=np.float64)
+    demeaned = np.asarray(result.demeaned, dtype=np.float64)
+    w = np.ones_like(y) if weights is None else np.asarray(weights, dtype=np.float64)
+    num_sq = den_sq = 0.0
+    for c in cats:
+        c = np.asarray(c)
+        num_sq += np.square(np.bincount(c, weights=w * demeaned)).sum()
+        den_sq += np.square(np.bincount(c, weights=w * y)).sum()
+    relative = num_sq**0.5 / max(den_sq**0.5, 1e-15)
+    assert relative < tol, (
+        f"independent normal-equation residual {relative} exceeds {tol}"
+    )
+
+
+def test_coefficient_layout_locates_unidentified_and_round_trips():
+    # firm level 2 is a singleton in the (non-first) slope term, so its slope
+    # direction is unidentified.
+    worker = np.array([0, 0, 1, 1, 2, 2], np.uint32)
+    firm = np.array([2, 0, 0, 1, 1, 0], np.uint32)
+    x = np.array([0.5, -1.0, 0.3, 2.0, -0.7, 1.1])
+    y = np.array([1.0, 2.0, 3.0, 1.5, 0.4, -0.2])
+
+    res = solve([Effect(worker, True), Effect(firm, True, [x])], y)
+    layout = res.layout
+    assert isinstance(layout, CoefficientLayout)
+    assert layout.n_dofs() == len(res.x)
+    assert [
+        (layout.n_levels(t), layout.n_columns(t)) for t in range(layout.n_terms())
+    ] == [
+        (3, 1),
+        (3, 2),
+    ]
+
+    # The reported unidentified direction resolves to a zero coefficient slot.
+    (u,) = res.unidentified
+    assert res.x[layout.index(u.term, u.level, u.column)] == 0.0
+
+    # UnidentifiedDirection is a frozen value type: a repeated solve yields a
+    # distinct-but-equal instance that reprs identically, compares/hashes equal,
+    # dedups in a set, and is unequal to an arbitrary object.
+    (u2,) = solve([Effect(worker, True), Effect(firm, True, [x])], y).unidentified
+    assert u is not u2
+    assert repr(u) == "UnidentifiedDirection(term=1, level=2, column=1)"
+    assert u == u2 and hash(u) == hash(u2)
+    assert len({u, u2}) == 1
+    assert u != (u.term, u.level, u.column)
+
+    # index and address are mutual inverses over the whole vector.
+    for i in range(layout.n_dofs()):
+        assert layout.index(*layout.address(i)) == i
+
+    # Out-of-range coordinates raise instead of reading the wrong coefficient.
+    with pytest.raises(IndexError):
+        layout.index(u.term, u.level, layout.n_columns(u.term))
+    with pytest.raises(IndexError):
+        layout.address(layout.n_dofs())
+
+
+def test_free_solve_positional_order_is_weights_then_options():
+    # Pins (design, y, weights, options, ...): a weights array 3rd and
+    # LsmrOptions 4th must be accepted. A re-swap would parse the array as
+    # options (and LsmrOptions as weights) and raise.
+    rng = np.random.default_rng(0)
+    cats = as_solver_categories(
+        [rng.integers(0, 8, size=300), rng.integers(0, 6, size=300)]
+    )
+    y = rng.standard_normal(300)
+    w = rng.uniform(0.5, 2.0, size=300)
+    result = solve(cats, y, w, LsmrOptions(maxiter=2000))
+    assert result.converged
+
+
+def test_one_shot_solve_surfaces_build_warnings():
+    # A frustrated slope design with scaling certification disabled emits a
+    # build warning; the one-shot solve/solve_batch must re-emit it, matching
+    # the persistent Solver (#103).
+    f = np.array([0, 0, 0, 1, 1, 1], np.uint32)
+    g = np.array([0, 1, 2, 0, 1, 2], np.uint32)
+    z = np.array([-2.0, 1.0, 1.0, -1.0, -1.0, 2.0])
+    y = np.array([1.0, -2.0, 0.5, 3.0, -1.5, 2.5])
+    from within import solve_batch
+
+    design = [Effect(f, True, [z]), Effect(g, True)]
+    precond = PreconditionerConfig.Additive(
+        local_solver=LocalSolverConfig(scaling=ScalingConfig(max_iterations=0))
+    )
+
+    def user_warnings(call):
+        with warnings.catch_warnings(record=True) as record:
+            warnings.simplefilter("always")
+            call()
+        return [str(w.message) for w in record if issubclass(w.category, UserWarning)]
+
+    persistent = user_warnings(lambda: Solver(design, preconditioner=precond))
+    assert persistent, "fixture should emit a build warning"
+    assert user_warnings(lambda: solve(design, y, preconditioner=precond)) == persistent
+    assert (
+        user_warnings(
+            lambda: solve_batch(design, np.column_stack([y, y]), preconditioner=precond)
+        )
+        == persistent
+    )
 
 
 @pytest.fixture()
@@ -41,14 +152,15 @@ class TestSolveDefaults:
         assert result.converged
         assert result.iterations > 0
         assert result.residual < 1e-6
+        assert_normal_equations_satisfied(cats, y, result, 1e-6)
 
     def test_unpreconditioned(self, problem):
         cats, y = problem
         result = solve(
             as_solver_categories(cats),
             y,
-            LsmrOptions(),
-            preconditioner=PreconditionerConfig.Off,
+            options=LsmrOptions(),
+            preconditioner=PreconditionerConfig.Off(),
         )
         assert result.converged
 
@@ -67,19 +179,19 @@ class TestPreconditioners:
         result = solve(
             as_solver_categories(cats),
             y,
-            LsmrOptions(),
-            preconditioner=PreconditionerConfig.Additive,
+            options=LsmrOptions(),
+            preconditioner=PreconditionerConfig.Additive(),
         )
         assert result.converged
 
     def test_advanced_additive_schwarz(self, problem):
-        """Test advanced config via AdditiveSchwarz."""
+        """Test advanced config via additive Schwarz."""
         cats, y = problem
         result = solve(
             as_solver_categories(cats),
             y,
-            LsmrOptions(),
-            preconditioner=AdditiveSchwarz(),
+            options=LsmrOptions(),
+            preconditioner=PreconditionerConfig.Additive(),
         )
         assert result.converged
 
@@ -92,8 +204,8 @@ class TestPreconditioners:
         result = solve(
             categories,
             y,
-            LsmrOptions(maxiter=2000),
-            preconditioner=PreconditionerConfig.Diagonal,
+            options=LsmrOptions(maxiter=2000),
+            preconditioner=PreconditionerConfig.Diagonal(),
         )
         assert result.converged
         assert np.all(np.isfinite(result.x))
@@ -162,6 +274,7 @@ class TestSolveResult:
         assert isinstance(result.x, np.ndarray)
         assert result.x.dtype == np.float64
         assert len(result.x) == 100  # 50 + 50 levels
+        assert result.unidentified == []
         assert result.time_total >= 0
         assert result.time_setup >= 0
         assert result.time_solve >= 0
@@ -182,6 +295,17 @@ class TestContiguityWarning:
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             solve(cats_f, y)
+
+    def test_column_reversed_f_view_no_warning(self, problem):
+        # Reversing columns keeps each column contiguous (row stride == itemsize),
+        # so ingest borrows them zero-copy and no warning applies.
+        cats, y = problem
+        cats_rev = as_solver_categories(cats)[:, ::-1]
+        assert cats_rev.strides[0] == cats_rev.itemsize
+        assert cats_rev.strides[1] < 0
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            solve(cats_rev, y)
 
 
 # ---------------------------------------------------------------------------
@@ -212,10 +336,10 @@ class TestSolver:
         np.testing.assert_array_equal(r1.x, r2.x)
 
     def test_solver_no_preconditioner(self, problem):
-        """Solver with PreconditionerConfig.Off works."""
+        """Solver with PreconditionerConfig.Off() works."""
         cats, y = problem
         solver = Solver(
-            as_solver_categories(cats), preconditioner=PreconditionerConfig.Off
+            as_solver_categories(cats), preconditioner=PreconditionerConfig.Off()
         )
         result = solver.solve(y)
         assert result.converged
@@ -258,7 +382,10 @@ class TestSolverBatch:
         assert len(batch.iterations) == 2
         assert len(batch.residual) == 2
         assert len(batch.time_solve) == 2
+        # The method reuses the built preconditioner, so it reports no build cost.
+        assert batch.time_setup == 0.0
         assert batch.time_total >= 0
+        assert batch.unidentified == []
 
 
 class TestSolverSerde:
@@ -276,6 +403,10 @@ class TestSolverSerde:
 
         # Reuse in new solver
         solver2 = Solver(categories, preconditioner=precond)
+        assert (
+            solver2.preconditioner.build_duration_seconds
+            == precond.build_duration_seconds
+        )
         r2 = solver2.solve(y)
         np.testing.assert_allclose(r2.x, r1.x, atol=1e-10)
 
@@ -300,7 +431,7 @@ class TestSolverSerde:
     def test_no_preconditioner_returns_none(self, problem):
         cats, y = problem
         solver = Solver(
-            as_solver_categories(cats), preconditioner=PreconditionerConfig.Off
+            as_solver_categories(cats), preconditioner=PreconditionerConfig.Off()
         )
         assert solver.preconditioner is None
 
@@ -312,7 +443,7 @@ class TestSolverSerde:
         )
         y = np.array([1.0, 2.0, 1.5, 2.5, 3.0, 3.5])
 
-        solver1 = Solver(categories, preconditioner=PreconditionerConfig.Diagonal)
+        solver1 = Solver(categories, preconditioner=PreconditionerConfig.Diagonal())
         r1 = solver1.solve(y)
         precond = solver1.preconditioner
 
@@ -324,6 +455,7 @@ class TestSolverSerde:
 
         precond2 = pickle.loads(pickle.dumps(precond))
         np.testing.assert_array_equal(precond.apply(x), precond2.apply(x))
+        assert precond2.build_duration_seconds == precond.build_duration_seconds
 
         solver2 = Solver(categories, preconditioner=precond2)
         r2 = solver2.solve(y)
@@ -338,7 +470,11 @@ class TestSolverSerde:
 class TestAliases:
     def test_additive_alias(self, problem):
         cats, y = problem
-        result = solve(as_solver_categories(cats), y, preconditioner=AdditiveSchwarz())
+        result = solve(
+            as_solver_categories(cats),
+            y,
+            preconditioner=PreconditionerConfig.Additive(),
+        )
         assert result.converged
 
 
@@ -353,6 +489,10 @@ class TestSolveBatchFreeFunction:
 
         result = solve_batch(categories, Y)
         assert all(result.converged)
+        # The free solve_batch folds the shared preconditioner build into
+        # time_setup; a dropped build cost would read as exactly 0.
+        assert result.time_setup > 0
+        assert result.time_setup <= result.time_total
 
     def test_solve_batch_matches_individual(self, problem):
         cats, y = problem
@@ -366,6 +506,27 @@ class TestSolveBatchFreeFunction:
         r2 = solve(categories, y2)
         np.testing.assert_allclose(batch.x[:, 0], r1.x, atol=1e-10)
         np.testing.assert_allclose(batch.x[:, 1], r2.x, atol=1e-10)
+
+    def test_solve_batch_effect_terms_match_individual(self):
+        f = np.array([0, 0, 0, 1, 1, 1], dtype=np.uint32)
+        g = np.array([0, 1, 2, 0, 1, 2], dtype=np.uint32)
+        z = np.array([-2.0, 1.0, 1.0, -1.0, -1.0, 2.0])
+        Y = np.column_stack(
+            [
+                np.array([1.0, -2.0, 0.5, 3.0, -1.5, 2.5]),
+                np.array([0.3, 1.1, -0.7, 2.2, 0.9, -1.4]),
+            ]
+        )
+        from within import Effect, solve_batch
+
+        effects = [Effect(f, True, [z]), Effect(g, True)]
+        batch = solve_batch(effects, Y)
+        for j in range(Y.shape[1]):
+            single = solve(effects, Y[:, j].copy())
+            np.testing.assert_allclose(batch.x[:, j], single.x, atol=1e-10)
+            np.testing.assert_allclose(
+                batch.demeaned[:, j], single.demeaned, atol=1e-10
+            )
 
     def test_solve_batch_result_shapes(self, problem):
         cats, y = problem
@@ -413,3 +574,24 @@ class TestGenerateSyntheticData:
         np.testing.assert_array_equal(c1, c2)
         np.testing.assert_array_equal(x1, x2)
         np.testing.assert_array_equal(y1, y2)
+
+
+class TestEffectDesign:
+    def test_intercept_only_matches_categories_path(self):
+        # The issue's trust anchor: an intercept-only effect design must be
+        # bit-identical to the equivalent categories-matrix solve.
+        rng = np.random.default_rng(0)
+        n = 300
+        col0 = rng.integers(0, 4, size=n).astype(np.uint32)
+        col1 = rng.integers(0, 6, size=n).astype(np.uint32)
+        y = rng.standard_normal(n)
+
+        categories = np.asfortranarray(np.column_stack([col0, col1]))
+        from_categories = solve(categories, y)
+        from_effects = solve(
+            [Effect(col0, intercept=True), Effect(col1, intercept=True)], y
+        )
+
+        assert from_effects.converged
+        np.testing.assert_array_equal(from_effects.x, from_categories.x)
+        np.testing.assert_array_equal(from_effects.demeaned, from_categories.demeaned)
