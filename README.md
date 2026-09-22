@@ -8,7 +8,7 @@ By the Frisch-Waugh-Lovell theorem, estimating a regression of the form *y = Xβ
 
 ## Scope
 
-`within` is a low-level fixed-effects kernel. Callers pass pre-factorized categorical codes: contiguous 0-based `uint32` level codes in F-order (column-major) arrays. Formula-level convenience — DataFrames, string/object categoricals, `pandas.factorize`, and formula parsing — is intentionally out of scope and belongs to a frontend layer built on top. The pyfixest-style workflow is served by such a frontend calling `within` underneath.
+`within` is a low-level fixed-effects kernel. Callers pass categorical labels as `uint32` F-order (column-major) arrays. Labels need not be contiguous: observed labels are compacted internally, while result layouts retain the caller-visible labels. Formula-level convenience — DataFrames, string/object categoricals, `pandas.factorize`, and formula parsing — is intentionally out of scope and belongs to a frontend layer built on top. The pyfixest-style workflow is served by such a frontend calling `within` underneath.
 
 ## Installation
 
@@ -38,7 +38,7 @@ fe = np.asfortranarray(np.column_stack([
 ]))
 y = np.random.randn(n)
 
-# Default: additive Schwarz + LSMR
+# Default: the adaptive diagonal→Schwarz ladder + LSMR
 result = solve(fe, y)
 
 # Custom tolerance / iteration cap
@@ -49,6 +49,27 @@ result = solve(fe, y, weights=np.ones(n))
 
 # Opt into diagonal/Jacobi preconditioning
 result = solve(fe, y, preconditioner=PreconditionerConfig.Diagonal())
+```
+
+### R bindings
+
+The [`withinr`](withinr/) package exposes the Rust solver through generated
+[extendr](https://extendr.rs/) bindings. It supports weighted demeaning,
+batch responses, varying slopes, and reusable solvers and preconditioners.
+See [withinr/README.md](withinr/README.md) for the API and commands to regenerate
+all glue code and build an offline source package for CRAN.
+
+## FWL regression example
+
+```python
+beta_true = np.array([1.0, -2.0, 0.5])
+X = np.random.randn(n, 3)
+y = X @ beta_true + np.random.randn(n)
+
+result = solve_batch(fe, np.column_stack([y, X]))
+y_tilde, X_tilde = result.demeaned[:, 0], result.demeaned[:, 1:]
+beta_hat = np.linalg.lstsq(X_tilde, y_tilde, rcond=None)[0]
+print(np.round(beta_hat, 4))  # [ 0.9982 -2.006   0.5005]
 ```
 
 ### Varying slopes
@@ -62,124 +83,65 @@ from within import solve, Effect
 
 firm = np.random.randint(0, 500, n).astype(np.uint32)
 year = np.random.randint(0, 20, n).astype(np.uint32)
-x = np.random.randn(n)
+x = np.random.randn(n)  # covariate whose slope varies by firm
 
 result = solve(
     [
-        Effect(firm, intercept=True, slopes=[x]),
-        Effect(year, intercept=True),
+        Effect(firm, intercept=True, slopes=[x]),  # firm intercept + firm-specific x slope
+        Effect(year, intercept=True),              # year intercept
     ],
     y,
 )
 
+# Read firm level 3's x-slope via the layout map (column 0 = intercept, 1 = first slope):
 i = result.layout.index(0, 3, 1)
 print(result.x[i])
 ```
 
 ## Python API
 
+### High-level functions
+
 | Function | Description |
 |---|---|
 | `solve(design, y, weights?, options?, preconditioner?)` | Solve a single right-hand side. Returns `SolveResult`. |
 | `solve_batch(design, Y, weights?, options?, preconditioner?)` | Solve multiple RHS vectors in parallel. `Y` has shape `(n_obs, k)`. Returns `BatchSolveResult`. |
 
-`design` is either a 2-D `uint32` array or a list of `Effect` terms.
+`design` is a persistent `Design`, a 2-D `uint32` array of shape `(n_obs, n_factors)`, or a list of `Effect` terms (see [Varying slopes](#varying-slopes)). A `UserWarning` is emitted when a C-contiguous categories array is passed — use `np.asfortranarray(design)` for best performance.
 
-For repeated solves with the same design, `Solver` builds the preconditioner
-once and reuses it.
+### Persistent solver
+
+For repeated solves with the same design matrix, `Design` reuses the preprocessed observation storage and `Solver` builds the weight-dependent state and preconditioner once.
 
 ```python
-from within import Solver
+from within import Design, Solver, solve
 
-solver = Solver(fe)
-r = solver.solve(y)
+design = Design(fe)
+solver = Solver(design)
+r = solver.solve(y)                            # reuses preconditioner
 r = solver.solve_batch(np.column_stack([y, X]))
-precond = solver.preconditioner
-solver2 = Solver(fe, preconditioner=precond)
+
+precond = solver.preconditioner                # picklable property
+solver2 = Solver(design, preconditioner=precond)  # skip re-factorization
+
+# Reuse design preprocessing while rebuilding weight-dependent solver state.
+weighted = solve(design, y, weights=np.ones(n))
 ```
 
 | Property / Method | Description |
 |---|---|
-| `Solver(design, weights?, preconditioner?)` | Build a persistent solver. |
-| `.solve(y, options?)` | Solve one right-hand side. |
-| `.solve_batch(Y, options?)` | Solve multiple right-hand sides. |
-| `.preconditioner` | Return the built, reusable `Preconditioner`, or `None`. |
-
-## R quickstart
-
-Requires R and a Rust toolchain (`cargo` on `PATH`).
-
-From the repository root, use `devtools` to install R dependencies and build the
-package:
-
-```r
-install.packages("devtools")
-Sys.setenv(NOT_CRAN = "true")
-devtools::install_deps("withinr/", dependencies = TRUE)
-devtools::load_all("withinr/")
-```
-
-Example (FWL with two-way fixed effects):
-
-```r
-set.seed(42)
-n <- 1000
-n_firms <- 50L
-n_years <- 20L
-
-# 1-based fixed-effect ids in R
-firm <- rep(seq_len(n_firms), each = n_years)
-year <- rep(seq_len(n_years), times = n_firms)
-categories <- cbind(firm, year)
-
-beta <- 1.5
-firm_fe <- rnorm(n_firms, sd = 3)[firm]
-year_fe <- rnorm(n_years, sd = 1)[year]
-x <- rnorm(n) + 0.3 * firm_fe
-y <- beta * x + firm_fe + year_fe + rnorm(n, sd = 0.5)
-
-res <- withinr::within_solve_batch(categories, cbind(y, x))
-y_tilde <- res$demeaned[, 1]
-x_tilde <- res$demeaned[, 2]
-beta_hat <- sum(x_tilde * y_tilde) / sum(x_tilde^2)
-
-print(beta_hat)
-print(res$converged)
-```
-
-| Function | Description |
-|---|---|
-| `within_solve(design, y, options?, weights?, preconditioner?)` | Solve a single right-hand side. |
-| `within_solve_batch(design, Y, options?, weights?, preconditioner?)` | Solve multiple RHS vectors in parallel. |
-
-In R, `design` is either a 1-based integer category matrix or a list of
-`Effect()` terms. For repeated solves, `Solver` builds the preconditioner once
-and reuses it.
-
-```r
-solver <- withinr::Solver(categories)
-r <- solver$solve(y)
-r <- solver$solve_batch(cbind(y, x))
-
-precond <- solver$preconditioner()
-payload <- precond$serialize()
-solver2 <- withinr::Solver(categories, preconditioner = withinr::Preconditioner(payload))
-```
-
-| Property / Method | Description |
-|---|---|
+| `Design(design)` | Build an owned native design for reuse across solves and solvers. |
 | `Solver(design, weights?, preconditioner?)` | Build solver. Factorizes the preconditioner at construction. |
-| `$solve(y, options?)` | Solve a single RHS with the given LSMR tuning. |
-| `$solve_batch(Y, options?)` | Solve multiple RHS columns in parallel. |
-| `$preconditioner()` | Return the built `Preconditioner`, or `NULL`. Reuse via `Solver(design, preconditioner=p)`. |
+| `.solve(y, options?)` | Solve a single RHS with the given LSMR tuning. Returns `SolveResult`. |
+| `.solve_batch(Y, options?)` | Solve multiple RHS columns in parallel. Returns `BatchSolveResult`. |
+| `.preconditioner` | Return the built `Preconditioner` (picklable), or `None`. Reuse via `Solver(design, preconditioner=p)`. |
 
-## Shared API concepts
 
 ### Solver configuration
 
 | Class | Description |
 |---|---|
-| `LsmrOptions(tol=1e-8, maxiter=1000, local_size=None)` / `LsmrOptions(tol = 1e-8, maxiter = 1000L, local_size = NULL)` | Modified LSMR. `local_size` enables windowed reorthogonalization. |
+| `LsmrOptions(tol=1e-8, maxiter=1000, local_size=None)` | Modified LSMR. `local_size` enables windowed reorthogonalization. |
 
 ### Preconditioners
 
@@ -187,34 +149,32 @@ The `preconditioner` argument accepts any of:
 
 | Form | Meaning |
 |---|---|
-| `None` / `NULL` (default) | Library default — Additive Schwarz with sensible defaults. |
-| `PreconditionerConfig.Off()` / `PreconditionerConfig$Off` | Explicit identity — solve unpreconditioned. |
-| `PreconditionerConfig.Additive()` / `PreconditionerConfig$Additive` | Additive Schwarz shortcut, equivalent to the default. |
-| `PreconditionerConfig.Diagonal()` / `PreconditionerConfig$Diagonal` | Diagonal/Jacobi preconditioner using `diag(D^T W D)^{-1}`. |
-| `PreconditionerConfig.Additive(...)` / `AdditiveSchwarz(...)` | Tuned additive Schwarz configuration. |
+| `None` (default) | Library default — Adaptive: diagonal, escalating to additive Schwarz on a stalled contraction. |
+| `PreconditionerConfig.Off()` | Explicit identity — solve unpreconditioned. |
+| `PreconditionerConfig.Additive()` | Additive Schwarz shortcut, built up front. |
+| `PreconditionerConfig.Diagonal()` | Diagonal/Jacobi preconditioner using `diag(D^T W D)^{-1}`. |
+| `PreconditionerConfig.Additive(local_solver?, reduction?)` | Tuned additive Schwarz. Argument types import from `within.config`. |
+| `PreconditionerConfig.Adaptive(local_solver?, reduction?, stall?)` | Tuned form of the default; the factorization is built only on escalation. |
 | `Preconditioner` instance | Reuse a previously-built preconditioner across solvers. |
 
 `PreconditionerConfig` is a tagged union: each variant is a subclass, so instances
 support `match`/`case` and compare by value. A built preconditioner exposes
 the configuration used to construct it as `.config` and its original build duration in seconds
 as `.build_duration_seconds`; both are preserved across pickling and reuse.
-R built-preconditioner environments expose the same information as `$config`
-and `$build_duration_seconds` and can be serialized with `$serialize()`.
 
-### Local solver configuration (advanced)
+### Local solver configuration (advanced — `within.config`)
 
 | Class | Description |
 |---|---|
-| `LocalSolverConfig(approx_chol?, schur?, dense_threshold?, scaling?, ridge?)` | Schur reduction + approximate Cholesky. Omit `schur` for the library default. |
-| `Schur.approximate(config?)` / `Schur.exact()`; `Schur$Approximate(config?)` / `Schur$Exact` | Approximate or exact Schur reduction. |
+| `LocalSolverConfig(approx_chol?, schur?, dense_threshold=24, scaling?)` | Schur reduction + approximate Cholesky. Omit `schur` for the library-default approximate variant; pass `schur=Schur.exact()` to request an exact Schur (slower, used for validation). |
+| `Schur.approximate(config?)` / `Schur.exact()` | Schur-reduction mode passed as `LocalSolverConfig(schur=...)`. |
 | `ApproxCholConfig(seed=0, split_merge=None)` | Approximate Cholesky parameters. |
 | `ApproxSchurConfig(seed=0, split=1)` | Approximate Schur complement sampling parameters. |
-| `ScalingConfig(...)` | Signed-component dominance certification policy. |
 | `ReductionStrategy` | `Auto` (default), `AtomicScatter`, `ParallelReduction` (class attributes, not an `Enum`). |
 
 ### Result types
 
-**`SolveResult`**: `x` (coefficients), `unidentified` (directions the data cannot identify), `warnings`, `layout` (address-to-flat-index metadata; a lazy method-bearing handle in R), `demeaned` (residuals), `converged`, `iterations`, `residual`, `time_total`, `time_setup`, `time_solve`.
+**`SolveResult`**: `x` (coefficients), `unidentified` (directions the data cannot identify, as `UnidentifiedDirection(term, level, column)` records), `layout` (a `CoefficientLayout` mapping a `(term, level, column)` address to its flat `x` index and back), `demeaned` (residuals), `converged`, `iterations`, `residual`, `time_total`, `time_setup`, `time_solve`.
 
 **`BatchSolveResult`**: Same fields, with `converged`, `iterations`, `residual`, and `time_solve` as lists (one entry per RHS).
 
@@ -230,7 +190,7 @@ use within::config::{LocalSolverConfig, ReductionStrategy};
 let categories = /* Array2<u32> of shape (n_obs, n_factors) */;
 let y: &[f64] = /* response vector */;
 
-// Default: LSMR + additive Schwarz (None → library default)
+// Default: LSMR + the adaptive ladder (None → library default)
 let r = solve(categories.view(), &y, None, &LsmrOptions::default(), None)?;
 assert!(r.converged);
 
@@ -250,11 +210,37 @@ let r = solve(categories.view(), &y, None, &lsmr, &diagonal)?;
 Persistent solver — build once, solve many:
 
 ```rust
-use within::Solver;
+use ndarray::array;
+use within::{solve, Channel, CoefficientAddress, Design, Solver};
 
-let solver = Solver::new(categories.view(), None, None)?;
-let r1 = solver.solve(&y, &LsmrOptions::default())?;
-let r2 = solver.solve(&another_y, &LsmrOptions::default())?;  // reuses preconditioner
+// Caller labels are deliberately non-contiguous.
+let categories = array![
+    [10_u32, 100],
+    [20, 100],
+    [10, 900],
+    [20, 900],
+];
+let y = [1.0, 2.0, 3.0, 4.0];
+
+// Build and compact the design once, then share it across solvers.
+let design = Design::from_categories(categories.view())?;
+let unweighted = Solver::new(&design, None, None)?;
+let weights = [1.0, 2.0, 1.0, 2.0];
+let weighted = Solver::new(&design, Some(&weights), None)?;
+
+let result = unweighted.solve(&y, None)?;
+let weighted_result = weighted.solve(&y, None)?;
+let one_shot_result = solve(&design, &y, None, None, None)?;
+assert!(weighted_result.converged && one_shot_result.converged);
+
+// Internal factor positions stay private; result lookup uses caller labels.
+let address = CoefficientAddress {
+    channel: Channel { term: 1, column: 0 },
+    level: 900,
+};
+let slot = result.layout.index(address).expect("observed label");
+assert_eq!(result.layout.address(slot), Some(address));
+assert_eq!(result.x.len(), 4); // two observed levels in each of two factors
 ```
 
 `solve` and `Solver::new` take the preconditioner as `impl Into<PreconditionerInput>`:
@@ -265,13 +251,14 @@ let r2 = solver.solve(&another_y, &LsmrOptions::default())?;  // reuses precondi
 
 | Type | Variants / Fields |
 |---|---|
+| `Design` | Reusable immutable design; build with `Design::from_categories` or `Design::new`, then share via `Solver::new(&design, ...)` or `solve(&design, ...)`. |
 | `LsmrOptions` | `{ tol: f64, maxiter: usize, local_size: Option<usize> }` |
 | `PreconditionerConfig` | `Off` \| `Additive { local_solver: LocalSolverConfig, reduction: ReductionStrategy }` \| `Diagonal` (`#[non_exhaustive]`) |
-| `LocalSolverConfig` | `{ approx_chol, schur: SchurMode, dense_threshold, scaling, ridge }` |
+| `LocalSolverConfig` | `{ approx_chol, schur: SchurMode, dense_threshold, scaling }` |
 | `SchurMode` | `Approximate(ApproxSchurConfig)` \| `Exact` |
 | `Preconditioner` | Opaque built handle — reuse via `Solver::new(.., precond)` (owned or `&`) |
 | `Effect` | `Effect::new(levels: &[u32], intercept: bool, slopes: impl IntoIterator<Item = &[f64]>) -> Result<Self, BuildError>` |
-| `CoefficientAddress` | `{ channel: Channel { term, column }, level: usize }` |
+| `CoefficientAddress` | `{ channel: Channel { term, column }, level: u32 }` |
 | `CoefficientLayout` | `index(CoefficientAddress) -> Option<usize>`, `address(usize) -> Option<CoefficientAddress>`, `n_dofs()`, `n_terms()`, `n_levels(term)`, `n_columns(term)` |
 
 ### Varying slopes
@@ -323,9 +310,7 @@ crates/
   schwarz-precond/   Generic domain decomposition library (traits, solvers, Schwarz preconditioners)
   within/            Core fixed-effects solver (observation stores, domains, operators, orchestration)
   within-py/         PyO3 bridge (cdylib → within._within)
-  within-r/          Workspace mirror for the extendr bridge
 python/within/       Python package re-exporting the Rust extension
-withinr/             R package pinned to within 0.4.0 and patched to the workspace in development
 benchmarks/          Python benchmark framework
 ```
 

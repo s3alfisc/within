@@ -10,6 +10,7 @@
 #[cfg(test)]
 mod tests;
 
+use super::finite;
 use crate::{Operator, SolveError};
 use rayon::iter::{IndexedParallelIterator, ParallelIterator};
 use rayon::prelude::{ParallelSlice, ParallelSliceMut};
@@ -97,10 +98,14 @@ fn par_dot(a: &[f64], b: &[f64]) -> f64 {
 
 /// `α = √⟨v, p̃⟩`; a `vp` negative within `√ε·‖v‖‖p̃‖` clamps to 0, an indefinite `M` raises.
 fn alpha_from_vp(v: &[f64], p_tilde: &[f64]) -> Result<f64, SolveError> {
-    let vp = par_dot(v, p_tilde);
+    // `vp.max(0.0)` returns 0 for NaN, which α = 0 reports as an exact solve at x = 0.
+    let vp = finite(par_dot(v, p_tilde), "⟨v, Mv⟩")?;
     if vp < 0.0 {
-        let bound = f64::EPSILON.sqrt() * (par_dot(v, v) * par_dot(p_tilde, p_tilde)).sqrt();
-        if vp < -bound {
+        let norm_v = finite(super::vec_norm(v), "‖v‖")?;
+        let norm_p = finite(super::vec_norm(p_tilde), "‖p̃‖")?;
+        // Dividing by the smaller norm first keeps the sign decision exact where a product fails.
+        let (small, large) = (norm_v.min(norm_p), norm_v.max(norm_p));
+        if vp / small / large < -f64::EPSILON.sqrt() {
             return Err(SolveError::InvalidInput {
                 context: "mlsmr",
                 message: "preconditioner not positive definite (⟨v, Mv⟩ < 0)".to_string(),
@@ -240,12 +245,55 @@ pub(super) struct BidiagStep {
     pub(super) beta: f64,
 }
 
+/// A normal-equation residual `‖Âᵀ(rhs − A x)‖` and the `‖Âᵀ rhs‖` it is judged against.
+#[derive(Clone, Copy)]
+pub(super) struct NormalEquationResidual {
+    pub(super) norm: f64,
+    pub(super) reference: f64,
+}
+
+impl NormalEquationResidual {
+    /// The drop since `x = 0`; the clamp guards a reference that underflowed to zero.
+    pub(super) fn relative(&self) -> f64 {
+        self.norm / self.reference.max(f64::MIN_POSITIVE)
+    }
+
+    /// An overflowed reference makes the drop vacuous, so keep the stream's own instead.
+    fn rebase(&mut self, cold: f64) {
+        if cold > 0.0 && cold.is_finite() {
+            self.reference = cold;
+        }
+    }
+}
+
 /// True residual norms of a candidate solution, recomputed outside the recurrences.
 pub(super) struct Certificate {
     /// `‖rhs − A x‖`.
     pub(super) normr: f64,
-    /// `‖Âᵀ(rhs − A x)‖` in the stream's metric (`√(zᵀM⁻¹z)` when preconditioned).
-    pub(super) normar: f64,
+    /// In the stream's metric (`√(zᵀM⁻¹z)` when preconditioned).
+    pub(super) normar: NormalEquationResidual,
+    /// The same outside that metric; `None` when the stream has no metric.
+    pub(super) normar_raw: Option<NormalEquationResidual>,
+}
+
+impl Certificate {
+    /// The pair every [`LsmrResult`](super::LsmrResult) reports: `(‖rhs − A x‖, relative ‖Aᵀr‖)`.
+    pub(super) fn residuals(&self) -> (f64, f64) {
+        (self.normr, self.normar.relative())
+    }
+
+    /// Take the references from `cold`, an audit of `x = 0` against the warm start's original `b`.
+    pub(super) fn rebase(&mut self, cold: &Certificate) {
+        self.normar.rebase(cold.normar.norm);
+        if let (Some(raw), Some(cold_raw)) = (&mut self.normar_raw, cold.normar_raw) {
+            raw.rebase(cold_raw.norm);
+        }
+    }
+}
+
+/// `|ζ̄₀| = ‖Âᵀ rhs‖`, clamped positive so it can divide a relative normal-equation residual.
+pub(super) fn reference_norm(alpha: f64, beta: f64) -> f64 {
+    (alpha * beta).abs().max(f64::MIN_POSITIVE)
 }
 
 /// Stream feeding LSMR `(α, β)` pairs and the matching normalized `v_k`.
@@ -256,13 +304,29 @@ pub(super) trait Bidiagonalization {
     fn v(&self) -> &[f64];
     /// Clobbers the stream's buffers, so call it only on a terminating path.
     fn certify(&mut self, x: &[f64], rhs: &[f64]) -> Result<Certificate, SolveError>;
+    /// `‖Aᵀ rhs‖ / ‖rhs‖`, also clobbering. See [`operator_norm_below`]. A stream with no metric
+    /// has no direction to corroborate, so the default offers no bound and certifies nothing.
+    fn operator_norm_below(&mut self, _rhs: &[f64]) -> Result<f64, SolveError> {
+        Ok(0.0)
+    }
+}
+
+/// A lower bound on `‖A‖`, for auditing a stop reached before the stream could estimate one.
+/// Plain norms throughout: squaring `‖Aᵀ rhs‖` overflows at scales where this does not.
+fn operator_norm_below<A: Operator + ?Sized>(
+    operator: &A,
+    rhs: &[f64],
+    atr: &mut [f64],
+) -> Result<f64, SolveError> {
+    operator.apply_adjoint(rhs, atr)?;
+    Ok(super::vec_norm(atr) / super::vec_norm(rhs).max(f64::MIN_POSITIVE))
 }
 
 impl<A: Operator + ?Sized> Bidiagonalization for GolubKahan<'_, A> {
     fn step(&mut self) -> Result<BidiagStep, SolveError> {
         self.operator.apply(&self.bufs.v, &mut self.bufs.av)?;
         let beta_sq = axpy_with_sq_norm(&mut self.bufs.u, &self.bufs.av, -self.alpha);
-        let beta = beta_sq.sqrt();
+        let beta = finite(beta_sq.sqrt(), "β")?;
         if beta == 0.0 {
             // Lucky breakdown: zero `v` so `solution.update` contributes nothing.
             self.bufs.v.fill(0.0);
@@ -281,7 +345,7 @@ impl<A: Operator + ?Sized> Bidiagonalization for GolubKahan<'_, A> {
             reorth.reorthogonalize(&mut self.bufs.v);
             alpha_sq = par_dot(&self.bufs.v, &self.bufs.v);
         }
-        let alpha = alpha_sq.sqrt();
+        let alpha = finite(alpha_sq.sqrt(), "α")?;
         if alpha > 0.0 {
             scale_in_place(&mut self.bufs.v, 1.0 / alpha);
         }
@@ -302,7 +366,11 @@ impl<A: Operator + ?Sized> Bidiagonalization for GolubKahan<'_, A> {
         let normr = true_residual(self.operator, x, rhs, &mut self.bufs.av, &mut self.bufs.atu)?;
         Ok(Certificate {
             normr,
-            normar: super::vec_norm(&self.bufs.atu),
+            normar: NormalEquationResidual {
+                norm: super::vec_norm(&self.bufs.atu),
+                reference: self.normar0,
+            },
+            normar_raw: None,
         })
     }
 }
@@ -314,7 +382,7 @@ impl<A: Operator + ?Sized, M: Operator + ?Sized> Bidiagonalization
         let scale = -(self.alpha * self.beta_prev_inv);
         self.operator.apply(&self.bufs.v, &mut self.bufs.av)?;
         let beta_sq = axpy_with_sq_norm(&mut self.bufs.u, &self.bufs.av, scale);
-        let beta = beta_sq.sqrt();
+        let beta = finite(beta_sq.sqrt(), "β")?;
         if beta == 0.0 {
             // Lucky breakdown: zero `v` and its paired `p̃` so the update contributes nothing.
             self.bufs.v.fill(0.0);
@@ -344,12 +412,27 @@ impl<A: Operator + ?Sized, M: Operator + ?Sized> Bidiagonalization
 
     fn certify(&mut self, x: &[f64], rhs: &[f64]) -> Result<Certificate, SolveError> {
         let normr = true_residual(self.operator, x, rhs, &mut self.bufs.av, &mut self.bufs.atu)?;
+        let raw = super::vec_norm(&self.bufs.atu);
+        // `M⁻¹` is linear; the raw gradient's metric product overflows past `‖Aᵀr‖ ≈ 1e154`.
+        let scale = if raw.is_normal() { raw } else { 1.0 };
+        self.bufs.atu.iter_mut().for_each(|g| *g /= scale);
         self.preconditioner
             .apply(&self.bufs.atu, &mut self.bufs.v)?;
         Ok(Certificate {
             normr,
-            normar: alpha_from_vp(&self.bufs.v, &self.bufs.atu)?,
+            normar: NormalEquationResidual {
+                norm: scale * alpha_from_vp(&self.bufs.v, &self.bufs.atu)?,
+                reference: self.normar0,
+            },
+            normar_raw: Some(NormalEquationResidual {
+                norm: raw,
+                reference: self.normar_raw0,
+            }),
         })
+    }
+
+    fn operator_norm_below(&mut self, rhs: &[f64]) -> Result<f64, SolveError> {
+        operator_norm_below(self.operator, rhs, &mut self.bufs.atu)
     }
 }
 
@@ -385,6 +468,7 @@ pub(super) struct GolubKahan<'a, A: Operator + ?Sized> {
     bufs: GolubKahanBuffers,
     /// Last `α` emitted; needed by the next step's u-update.
     alpha: f64,
+    normar0: f64,
 }
 
 impl<'a, A: Operator + ?Sized> GolubKahan<'a, A> {
@@ -408,7 +492,7 @@ impl<'a, A: Operator + ?Sized> GolubKahan<'a, A> {
         }
 
         operator.apply_adjoint(&bufs.u, &mut bufs.v)?;
-        let alpha = par_dot(&bufs.v, &bufs.v).sqrt();
+        let alpha = finite(par_dot(&bufs.v, &bufs.v).sqrt(), "α")?;
         if alpha > 0.0 {
             scale_in_place(&mut bufs.v, 1.0 / alpha);
         }
@@ -422,6 +506,7 @@ impl<'a, A: Operator + ?Sized> GolubKahan<'a, A> {
                 operator,
                 bufs,
                 alpha,
+                normar0: reference_norm(alpha, beta),
             },
             BidiagStep { alpha, beta },
         ))
@@ -466,6 +551,8 @@ pub(super) struct ModifiedGolubKahan<'a, A: Operator + ?Sized, M: Operator + ?Si
     alpha: f64,
     /// `1/β_k`; cancels the unnormalization of `u` in the next step.
     beta_prev_inv: f64,
+    normar0: f64,
+    normar_raw0: f64,
 }
 
 impl<'a, A: Operator + ?Sized, M: Operator + ?Sized> ModifiedGolubKahan<'a, A, M> {
@@ -490,6 +577,7 @@ impl<'a, A: Operator + ?Sized, M: Operator + ?Sized> ModifiedGolubKahan<'a, A, M
         }
 
         operator.apply_adjoint(&bufs.u, &mut bufs.p_tilde)?;
+        let normar_raw0 = beta * super::vec_norm(&bufs.p_tilde);
 
         preconditioner.apply(&bufs.p_tilde, &mut bufs.v)?;
 
@@ -511,6 +599,8 @@ impl<'a, A: Operator + ?Sized, M: Operator + ?Sized> ModifiedGolubKahan<'a, A, M
                 bufs,
                 alpha,
                 beta_prev_inv: 1.0, // u was normalized by init
+                normar0: reference_norm(alpha, beta),
+                normar_raw0,
             },
             BidiagStep { alpha, beta },
         ))

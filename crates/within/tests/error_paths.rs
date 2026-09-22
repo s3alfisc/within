@@ -1,11 +1,12 @@
 use std::error::Error;
 
 use ndarray::Array2;
+use rstest::rstest;
 use schwarz_precond::SolveError;
 use within::observation::ObservationFrame;
 use within::{
     solve, solve_batch, BuildError, Design, Effect, LocalSolverConfig, LsmrOptions,
-    PreconditionerConfig, Solver, WithinError,
+    PreconditionerConfig, Solver, Staleness, WithinError,
 };
 
 // The Display/source()/From plumbing has one wiring check per enum, not per message.
@@ -46,7 +47,7 @@ fn test_weight_count_mismatch_error() {
     )
     .expect("frame ok");
     let design = Design::from_frame(frame).expect("valid design");
-    let result = Solver::new(design, Some(vec![1.0, 2.0]), None);
+    let result = Solver::new(design, Some(&[1.0, 2.0]), None);
     let err = result.expect_err("expected WeightCountMismatch error, got Ok");
     match err {
         BuildError::WeightCountMismatch { .. } => {}
@@ -118,13 +119,13 @@ fn test_non_finite_response_rejected() {
     // The persistent Solver API funnels through the same guard, so it cannot be bypassed.
     let solver = Solver::new(cats.view(), None, &precond).expect("solver");
     match solver.solve(&y, &params).unwrap_err() {
-        SolveError::InvalidInput { message, .. } => {
+        WithinError::Solve(SolveError::InvalidInput { message, .. }) => {
             assert!(
                 message.contains("index 1"),
                 "message names the index: {message}"
             );
         }
-        other => panic!("Expected InvalidInput via Solver::solve(), got: {other:?}"),
+        other => panic!("Expected Solve(InvalidInput) via Solver::solve(), got: {other:?}"),
     }
 
     // solve_batch funnels every column through Solver::solve; the bad value is in the 2nd RHS.
@@ -204,25 +205,50 @@ fn test_within_error_source_chains_through_transparent_wrapper() {
     assert!(e.source().is_some());
 }
 
-#[test]
-fn test_invalid_ridge_rejected() {
+#[derive(Debug, Clone, Copy)]
+enum InvalidField {
+    Ridge,
+    Tolerance,
+}
+
+/// Adaptive defers the build that would reject these, and with a single factor never runs it.
+/// Every dominance comparison is `>`, so an unvalidated NaN tolerance certifies each component
+/// silently — no `UnscalableComponent` under `Error`, and no `BuildWarning` under `Warn` either.
+#[rstest]
+fn test_invalid_local_solver_rejected(
+    #[values(-1e-9, f64::NAN, f64::INFINITY)] value: f64,
+    #[values(InvalidField::Ridge, InvalidField::Tolerance)] field: InvalidField,
+    #[values(false, true)] adaptive: bool,
+    #[values(1, 2)] n_factors: usize,
+) {
     let f = [0u32, 0, 1, 1];
     let g = [0u32, 1, 0, 1];
-    for ridge in [-1e-9, f64::NAN, f64::INFINITY] {
-        let precond = PreconditionerConfig::Additive {
-            local_solver: LocalSolverConfig {
-                ridge,
-                ..Default::default()
-            },
-            reduction: Default::default(),
-        };
-        let effects = vec![
-            Effect::new(&f, true, []).expect("f"),
-            Effect::new(&g, true, []).expect("g"),
-        ];
-        match Solver::new(effects, None, &precond) {
-            Err(BuildError::InvalidRidge { value }) => assert_eq!(value.to_bits(), ridge.to_bits()),
-            other => panic!("expected InvalidRidge for {ridge}, got {other:?}"),
-        }
+    let mut local_solver = LocalSolverConfig::default();
+    match field {
+        InvalidField::Ridge => local_solver.ridge = value,
+        InvalidField::Tolerance => local_solver.scaling.tolerance = value,
     }
+    let precond = if adaptive {
+        PreconditionerConfig::Adaptive {
+            local_solver,
+            reduction: Default::default(),
+            stall: Staleness::try_new(4, 0.9).expect("stall"),
+        }
+    } else {
+        PreconditionerConfig::Additive {
+            local_solver,
+            reduction: Default::default(),
+        }
+    };
+    let mut effects = vec![Effect::new(&f, true, []).expect("f")];
+    if n_factors == 2 {
+        effects.push(Effect::new(&g, true, []).expect("g"));
+    }
+    let err = Solver::new(effects, None, &precond).expect_err("rejected");
+    let rejected = match (field, &err) {
+        (InvalidField::Ridge, BuildError::InvalidRidge { value }) => *value,
+        (InvalidField::Tolerance, BuildError::InvalidScalingTolerance { value }) => *value,
+        _ => panic!("expected an invalid {field:?}, got {err:?}"),
+    };
+    assert_eq!(rejected.to_bits(), value.to_bits());
 }

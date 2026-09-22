@@ -7,7 +7,7 @@ use crate::channel::{Channel, ChannelPair};
 pub use schwarz_precond::SolveError;
 
 /// Errors produced while validating inputs or building solver components.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 #[non_exhaustive]
 pub enum BuildError {
     /// No observations provided.
@@ -77,6 +77,9 @@ pub enum BuildError {
     /// Local solver construction failed.
     #[error("local solver build failed: {0}")]
     LocalSolverBuild(String),
+    /// The thread pool a deferred preconditioner build runs on could not be created.
+    #[error("thread pool build failed: {0}")]
+    ThreadPool(String),
     /// Schwarz preconditioner structural validation failed.
     #[error("preconditioner build failed: {0}")]
     Preconditioner(#[source] schwarz_precond::BuildError),
@@ -99,7 +102,21 @@ pub enum BuildError {
         /// The offending value.
         value: f64,
     },
-    /// Usually raw entity IDs passed as factor codes, inflating `n_levels = max code + 1`.
+    /// Every dominance comparison is `>`, so a NaN or infinite slack silently certifies anything.
+    #[error("scaling tolerance must be finite and non-negative, got {value}")]
+    InvalidScalingTolerance {
+        /// The offending value.
+        value: f64,
+    },
+    /// The frame carries continuous columns that no term uses as a slope.
+    #[error("frame has {provided} loading columns but the terms claim {claimed}")]
+    UnclaimedLoadingColumns {
+        /// Loading columns referenced by the terms.
+        claimed: usize,
+        /// Continuous columns in the frame.
+        provided: usize,
+    },
+    /// The compact coefficient space exceeds the internal `u32` index width.
     #[error("design has {n_dofs} degrees of freedom, exceeding the u32 column-index limit")]
     DofSpaceExceedsU32 {
         /// Total degrees of freedom implied by the design.
@@ -129,7 +146,18 @@ pub enum BuildWarning {
         term: usize,
         /// Share of the covariate's weighted variation outside that term's span.
         relative_residual: f64,
+        /// Whether the direction spanning both terms left the solve space.
+        verdict: AliasVerdict,
     },
+}
+
+/// What became of a warned cross-term direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AliasVerdict {
+    /// A null of the design, kept out of the solve space.
+    Constrained,
+    /// Not certified as a null, so the iteration keeps it.
+    Kept,
 }
 
 impl std::fmt::Display for BuildWarning {
@@ -149,12 +177,22 @@ impl std::fmt::Display for BuildWarning {
                 slope,
                 term,
                 relative_residual,
-            } => write!(
-                f,
-                "slope covariate of {slope} is nearly collinear with the columns of term \
-                 {term} (relative residual {relative_residual:.2e}); the near-null direction \
-                 spanning both terms can inflate iteration counts by orders of magnitude"
-            ),
+                verdict,
+            } => {
+                let fate = match verdict {
+                    AliasVerdict::Constrained => "was removed from the solve space",
+                    AliasVerdict::Kept => {
+                        "was not certified as a null and stays in the solve space, where \
+                         iteration counts can inflate by orders of magnitude"
+                    }
+                };
+                write!(
+                    f,
+                    "slope covariate of {slope} is nearly collinear with the columns of term \
+                     {term} (relative residual {relative_residual:.2e}); the direction spanning \
+                     both terms {fate}"
+                )
+            }
         }
     }
 }

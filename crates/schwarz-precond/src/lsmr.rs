@@ -14,7 +14,7 @@ mod tests;
 use std::borrow::Cow;
 
 use crate::{Operator, SolveError};
-use bidiag::{BidiagStep, Bidiagonalization, GolubKahan, ModifiedGolubKahan};
+use bidiag::{BidiagStep, Bidiagonalization, Certificate, GolubKahan, ModifiedGolubKahan};
 use recurrence::{ConvergenceCriteria, LsmrRecurrenceState, RotationStep, SolutionState, Stop};
 
 /// Euclidean norm of a vector.
@@ -96,6 +96,7 @@ pub trait EscalationHandler {
 
 /// Escalates after `window` consecutive contraction ratios exceed `threshold`.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Staleness {
     window: usize,
     threshold: f64,
@@ -127,6 +128,43 @@ impl Staleness {
             return Err(StalenessError::InvalidThreshold { threshold });
         }
         Ok(Self { window, threshold })
+    }
+
+    /// Consecutive stalled iterations required before escalating.
+    pub fn window(&self) -> usize {
+        self.window
+    }
+
+    /// Contraction ratio above which an iteration counts as stalled.
+    pub fn threshold(&self) -> f64 {
+        self.threshold
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for Staleness {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct Helper {
+            window: usize,
+            threshold: f64,
+        }
+
+        let helper = Helper::deserialize(deserializer)?;
+        Self::try_new(helper.window, helper.threshold).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Default for Staleness {
+    /// Escalates after four consecutive residual reductions below 30% (ratio above 0.7).
+    fn default() -> Self {
+        Self {
+            window: 4,
+            threshold: 0.7,
+        }
     }
 }
 
@@ -164,7 +202,7 @@ impl EscalationHandler for StalenessRun {
 /// Optional behaviors for [`mlsmr`].
 #[derive(Clone, Copy, Default)]
 pub struct MlsmrOptions<'a> {
-    /// Initial iterate for a residual correction; tolerances remain relative to the original `‖b‖`.
+    /// Residual-correction start; tolerances stay relative to `‖b‖` (`‖b − A x₀‖` if `b = 0`).
     pub warm_start: Option<&'a [f64]>,
     /// Hands off to a stronger preconditioner mid-run; see [`EscalationPolicy`].
     pub escalation: Option<&'a dyn EscalationPolicy>,
@@ -186,7 +224,7 @@ pub fn lsmr<A: Operator + ?Sized>(
     validate_lsmr_inputs(operator, b, tol)?;
     let n = operator.ncols();
 
-    let b_norm = vec_norm(b);
+    let b_norm = finite(vec_norm(b), "rhs norm")?;
     if b_norm == 0.0 {
         return Ok(LsmrResult {
             x: vec![0.0; n],
@@ -201,7 +239,7 @@ pub fn lsmr<A: Operator + ?Sized>(
     let local_size = local_size.unwrap_or(0);
     let (bidiag, step1) = GolubKahan::init(operator, b, local_size)?;
     let criteria = ConvergenceCriteria::new(b_norm, tol);
-    lsmr_from_bidiag(bidiag, step1, b, b_norm, criteria, maxiter, None)
+    lsmr_from_bidiag(bidiag, step1, b, None, criteria, maxiter, None)
 }
 
 /// Preconditioned LSMR with `M ≈ AᵀA` and one `M⁻¹` application per iteration.
@@ -242,7 +280,8 @@ pub fn mlsmr<A: Operator + ?Sized, M: Operator + ?Sized>(
         }
     }
 
-    let b_norm = vec_norm(b);
+    // `b` is finite entrywise, but its norm sets the tolerance and an ∞ there certifies anything.
+    let b_norm = finite(vec_norm(b), "rhs norm")?;
     let local_size = local_size.unwrap_or(0);
 
     let rhs: Cow<'_, [f64]> = match warm_start {
@@ -256,13 +295,8 @@ pub fn mlsmr<A: Operator + ?Sized, M: Operator + ?Sized>(
             Cow::Owned(residual)
         }
     };
-    let rhs_norm = vec_norm(&rhs);
     // Unlike `b`, `rhs` is computed: an ∞ entry norms to NaN, which reads as β₁ = 0 downstream.
-    if !rhs_norm.is_finite() {
-        return Err(invalid_input(format!(
-            "warm-start residual b - A·x0 has non-finite norm {rhs_norm}"
-        )));
-    }
+    let rhs_norm = finite(vec_norm(&rhs), "warm-start residual norm")?;
     if rhs_norm == 0.0 {
         let (x, stop_reason) = match warm_start {
             Some(x0) => (x0.to_vec(), LsmrStopReason::WarmStartExact),
@@ -279,43 +313,75 @@ pub fn mlsmr<A: Operator + ?Sized, M: Operator + ?Sized>(
     }
 
     let (bidiag, step1) = ModifiedGolubKahan::init(operator, preconditioner, &rhs, local_size)?;
-    let criteria = ConvergenceCriteria::new(b_norm, tol);
-    let mut result = lsmr_from_bidiag(
+    let reference_norm = if b_norm > 0.0 { b_norm } else { rhs_norm };
+    let criteria = ConvergenceCriteria::new(reference_norm, tol);
+    lsmr_from_bidiag(
         bidiag,
         step1,
-        &rhs,
-        rhs_norm,
+        b,
+        warm_start,
         criteria,
         maxiter,
         escalation.map(|policy| policy.handler()),
-    )?;
-    if let Some(x0) = warm_start {
-        for (xi, &x0i) in result.x.iter_mut().zip(x0) {
-            *xi += x0i;
-        }
+    )
+}
+
+/// A warm-started stream measures its references from the correction's own residual, so a cold
+/// certificate restores them in terms of `rhs`.
+fn audit_against_rhs<B: Bidiagonalization>(
+    bidiag: &mut B,
+    x: &[f64],
+    rhs: &[f64],
+    x0: Option<&[f64]>,
+) -> Result<Certificate, SolveError> {
+    let cold = x0
+        .map(|_| bidiag.certify(&vec![0.0; x.len()], rhs))
+        .transpose()?;
+    let mut cert = bidiag.certify(x, rhs)?;
+    if let Some(cold) = &cold {
+        cert.rebase(cold);
     }
-    Ok(result)
+    Ok(cert)
 }
 
 /// Runs the LSMR recurrences over a preconditioner-specific bidiagonalization stream.
+///
+/// The stream solves for the correction to `x0`; results and the audit are in terms of `b`.
 fn lsmr_from_bidiag<B: Bidiagonalization>(
     mut bidiag: B,
     step1: BidiagStep,
-    rhs: &[f64],
-    rhs_norm: f64,
+    b: &[f64],
+    x0: Option<&[f64]>,
     criteria: ConvergenceCriteria,
     maxiter: usize,
     mut escalation: Option<Box<dyn EscalationHandler>>,
 ) -> Result<LsmrResult, SolveError> {
     let n = bidiag.v().len();
+    let total = |mut x: Vec<f64>| {
+        if let Some(x0) = x0 {
+            for (xi, &x0i) in x.iter_mut().zip(x0) {
+                *xi += x0i;
+            }
+        }
+        x
+    };
+    // A metric reporting no gradient at all may be hiding one outside itself.
     if step1.alpha == 0.0 {
+        let x = total(vec![0.0; n]);
+        let cert = bidiag.certify(&x, b)?;
+        let converged = criteria.corroborated(&cert, || bidiag.operator_norm_below(b))?;
+        let (residual_norm, normal_eq_residual) = cert.residuals();
         return Ok(LsmrResult {
-            x: vec![0.0; n],
-            converged: true,
+            x,
+            converged,
             iterations: 0,
-            residual_norm: rhs_norm,
-            normal_eq_residual: 0.0,
-            stop_reason: LsmrStopReason::InitialNormalEquationResidualZero,
+            residual_norm,
+            normal_eq_residual,
+            stop_reason: if converged {
+                LsmrStopReason::InitialNormalEquationResidualZero
+            } else {
+                LsmrStopReason::FalseConvergence
+            },
         });
     }
 
@@ -324,60 +390,65 @@ fn lsmr_from_bidiag<B: Bidiagonalization>(
     let mut solution = SolutionState::init(bidiag.v());
     let mut prev_rot = RotationStep::initial();
 
-    for itn in 1..=maxiter {
-        let step = bidiag.step()?;
-        convergence.observe(step);
-        let curr_rot = recurrence.step(step);
-        solution.update(bidiag.v(), curr_rot, prev_rot);
+    let (iterations, stop_reason) = 'run: {
+        for itn in 1..=maxiter {
+            let step = bidiag.step()?;
+            convergence.observe(step);
+            let curr_rot = recurrence.step(step);
+            solution.update(bidiag.v(), curr_rot, prev_rot);
 
-        // The tolerance test catches breakdown when the residual recurrences collapse.
-        if let Some(stop_reason) = match convergence.check(&recurrence) {
-            Stop::Continue => None,
-            Stop::ResidualTolerance => Some(LsmrStopReason::ResidualTolerance),
-            Stop::NormalEquationTolerance => Some(LsmrStopReason::NormalEquationTolerance),
-        } {
-            let x = solution.into_x();
-            let cert = bidiag.certify(&x, rhs)?;
-            let converged = convergence.certified(&cert, recurrence.zeta0);
-            return Ok(LsmrResult {
-                x,
-                converged,
-                iterations: itn,
-                residual_norm: cert.normr,
-                normal_eq_residual: cert.normar / recurrence.zeta0,
-                stop_reason: if converged {
-                    stop_reason
-                } else {
-                    LsmrStopReason::FalseConvergence
-                },
-            });
-        }
-        if let Some(rule) = escalation.as_deref_mut() {
-            let progress = Progress {
-                iteration: itn,
-                normal_eq_residual: recurrence.relative_normal_eq_residual(),
-            };
-            if rule.should_escalate(progress) {
+            // The tolerance test catches breakdown when the residual recurrences collapse.
+            if let Some(stop_reason) = match convergence.check(&recurrence) {
+                Stop::Continue => None,
+                Stop::ResidualTolerance => Some(LsmrStopReason::ResidualTolerance),
+                Stop::NormalEquationTolerance => Some(LsmrStopReason::NormalEquationTolerance),
+            } {
+                let x = total(solution.into_x());
+                let cert = audit_against_rhs(&mut bidiag, &x, b, x0)?;
+                let converged = convergence.certified(&cert);
+                let (residual_norm, normal_eq_residual) = cert.residuals();
                 return Ok(LsmrResult {
-                    x: solution.into_x(),
-                    converged: false,
+                    x,
+                    converged,
                     iterations: itn,
-                    residual_norm: recurrence.residual_estimate(),
-                    normal_eq_residual: progress.normal_eq_residual,
-                    stop_reason: LsmrStopReason::Escalated,
+                    residual_norm,
+                    normal_eq_residual,
+                    stop_reason: if converged {
+                        stop_reason
+                    } else {
+                        LsmrStopReason::FalseConvergence
+                    },
                 });
             }
+            if let Some(rule) = escalation.as_deref_mut() {
+                let progress = Progress {
+                    iteration: itn,
+                    normal_eq_residual: recurrence.relative_normal_eq_residual(),
+                };
+                if rule.should_escalate(progress) {
+                    break 'run (itn, LsmrStopReason::Escalated);
+                }
+            }
+            prev_rot = curr_rot;
         }
-        prev_rot = curr_rot;
-    }
-
+        (maxiter, LsmrStopReason::MaxIterations)
+    };
+    let x = total(solution.into_x());
+    // A warm run's recurrence measures the restart, so only an audit reports against `b`.
+    let (residual_norm, normal_eq_residual) = match x0 {
+        Some(_) => audit_against_rhs(&mut bidiag, &x, b, x0)?.residuals(),
+        None => (
+            recurrence.residual_estimate(),
+            recurrence.relative_normal_eq_residual(),
+        ),
+    };
     Ok(LsmrResult {
-        x: solution.into_x(),
+        x,
         converged: false,
-        iterations: maxiter,
-        residual_norm: recurrence.residual_estimate(),
-        normal_eq_residual: recurrence.relative_normal_eq_residual(),
-        stop_reason: LsmrStopReason::MaxIterations,
+        iterations,
+        residual_norm,
+        normal_eq_residual,
+        stop_reason,
     })
 }
 
@@ -404,6 +475,14 @@ fn validate_lsmr_inputs<A: Operator + ?Sized>(
         )));
     }
     Ok(())
+}
+
+/// Every comparison against a non-finite value is false, so it reads as a breakdown downstream.
+fn finite(value: f64, what: &str) -> Result<f64, SolveError> {
+    if !value.is_finite() {
+        return Err(invalid_input(format!("non-finite {what} ({value})")));
+    }
+    Ok(value)
 }
 
 fn invalid_input(message: String) -> SolveError {
