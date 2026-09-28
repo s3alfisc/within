@@ -1,9 +1,10 @@
-// Forward routine registration from C to the Rust static library.
-// R's dynamic loader calls R_init_withinr(); extendr generates
-// R_init_withinr_extendr() inside the Rust code.
+// We need to forward routine registration from C to Rust
+// to avoid the linker removing the static library.
 
 void R_init_withinr_extendr(void *dll);
+void register_extendr_panic_hook(void);
 
 void R_init_withinr(void *dll) {
+    register_extendr_panic_hook();
     R_init_withinr_extendr(dll);
 }

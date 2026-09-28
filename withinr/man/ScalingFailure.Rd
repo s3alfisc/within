@@ -3,6 +3,9 @@
 \name{ScalingFailure}
 \alias{ScalingFailure}
 \title{Scaling failure policy shortcut values}
+\usage{
+ScalingFailure
+}
 \description{
 Use these values in \code{\link[=ScalingConfig]{ScalingConfig()}}.
 }

@@ -4,17 +4,12 @@
 \alias{within_solve}
 \title{Solve fixed-effects normal equations}
 \usage{
-within_solve(
-  design,
-  y,
-  options = NULL,
-  weights = NULL,
-  preconditioner = NULL
-)
+within_solve(design, y, options = NULL, weights = NULL, preconditioner = NULL)
 }
 \arguments{
 \item{design}{Either an integer category matrix of shape
-\verb{(n_obs, n_factors)} with 1-based labels, or a list of \code{\link[=Effect]{Effect()}} terms.}
+\verb{(n_obs, n_factors)} with 1-based labels, a list of \code{\link[=Effect]{Effect()}} terms,
+or a reusable \code{\link[=Design]{Design()}}.}
 
 \item{y}{Numeric vector of length \code{n_obs}.}
 
@@ -22,20 +17,34 @@ within_solve(
 
 \item{weights}{Numeric vector of length \code{n_obs} or \code{NULL}.}
 
-\item{preconditioner}{Controls preconditioning. Five input forms are
-accepted: \code{NULL} builds the default additive Schwarz preconditioner,
+\item{preconditioner}{Controls preconditioning. The following input forms are
+accepted: \code{NULL} uses adaptive diagonal-to-Schwarz preconditioning,
 \code{PreconditionerConfig$Off} disables preconditioning,
 \code{PreconditionerConfig$Diagonal} uses diagonal/Jacobi scaling,
-\code{\link[=AdditiveSchwarz]{AdditiveSchwarz()}} overrides local-solver and reduction settings, and a
+\code{\link[=AdditiveSchwarz]{AdditiveSchwarz()}} builds Schwarz immediately, \code{\link[=Adaptive]{Adaptive()}} tunes the
+default adaptive strategy, and a
 built \code{\link[=Preconditioner]{Preconditioner()}} object reuses an existing factorization.}
 }
 \value{
-A named list with fields \code{x}, \code{unidentified}, \code{warnings},
-\code{layout}, \code{demeaned}, \code{converged}, \code{iterations},
-\code{residual}, \code{time_total}, \code{time_setup}, and \code{time_solve}.
+A named list with fields \code{x}, \code{unidentified}, \code{warnings}, \code{layout},
+\code{demeaned}, \code{converged}, \code{iterations}, \code{residual}, \code{time_total},
+\code{time_setup}, and \code{time_solve}.
 }
 \description{
 Computes fixed-effect coefficients by solving the normal equations
 \eqn{D^T W D x = D^T W y} where \eqn{D} is the dummy-variable design
 matrix implied by \code{design} and \eqn{W} is the diagonal weight matrix.
+}
+\details{
+Factor labels can have gaps. Coefficient addresses use the original
+1-based labels. Check \code{converged} before using \code{demeaned}; \code{warnings} contains
+diagnostic messages from native design and preconditioner construction.
+Native computations use one worker thread by default (adaptive builds may
+use a second). Set the environment
+variable \code{WITHINR_NUM_THREADS} before the first call to change this limit.
+}
+\examples{
+groups <- cbind(c(1L, 1L, 2L, 2L), c(1L, 2L, 1L, 2L))
+fit <- within_solve(groups, c(1, 3, 4, 8))
+fit$demeaned
 }

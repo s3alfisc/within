@@ -778,6 +778,7 @@ version = "0.4.0"
 dependencies = [
  "approx-chol",
  "ndarray",
+ "once_cell",
  "portable-atomic",
  "postcard",
  "rayon",
@@ -793,6 +794,7 @@ dependencies = [
  "extendr-api",
  "ndarray",
  "postcard",
+ "rayon",
  "within",
 ]
 

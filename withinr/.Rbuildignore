@@ -9,3 +9,8 @@
 ^src/.*\.dll$
 ^test_bindings\.R$
 ^benchmarks$
+^src/Makevars$
+^src/Makevars\.win$
+^examples$
+^README\.md$
+^cran-comments\.md$

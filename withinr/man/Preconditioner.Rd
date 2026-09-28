@@ -16,5 +16,6 @@ methods and \verb{$nrows}, \verb{$ncols}, \verb{$config}, and
 }
 \description{
 Deserializes a preconditioner from raw bytes produced by
-\code{solver$preconditioner()$serialize()}.
+\code{solver$preconditioner()$serialize()}. Bytes are specific to the native
+library's wire format and are not a permanent cross-version storage format.
 }

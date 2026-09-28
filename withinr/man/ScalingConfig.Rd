@@ -7,7 +7,8 @@
 ScalingConfig(tolerance = NULL, max_iterations = NULL, on_failure = NULL)
 }
 \arguments{
-\item{tolerance}{Positive certification tolerance, or \code{NULL} for the library default.}
+\item{tolerance}{Non-negative certification tolerance, or \code{NULL} for the
+library default.}
 
 \item{max_iterations}{Positive reduced-CG iteration budget, or \code{NULL}.}
 

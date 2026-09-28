@@ -6,3 +6,7 @@ src/*.so
 src/*.dll
 src/withinr.lib
 src/rust/vendor.tar.xz
+src/rust/vendor/
+src/rust/within-core/
+src/Makevars
+src/Makevars.win

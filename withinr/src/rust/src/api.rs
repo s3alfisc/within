@@ -11,7 +11,7 @@ use within::{
 };
 
 use crate::config::{parse_lsmr_options, parse_preconditioner, PreconditionerArg};
-use crate::convert::{err, extract_weights, or_throw, parse_design, usize_to_i32, weights_slice};
+use crate::convert::{err, or_throw, parse_design, usize_to_i32, weights_slice};
 use crate::results::{batch_result_to_list, result_to_list};
 
 /// Owned-store solver held behind the R external pointer.
@@ -30,6 +30,17 @@ fn matrix_columns(matrix: &RMatrix<f64>) -> Vec<&[f64]> {
         .collect()
 }
 
+// Persistent designs share owned observation storage across weighted solvers.
+#[extendr]
+fn design_new_impl(design: Robj) -> ExternalPtr<within::Design<'static>> {
+    or_throw(parse_design(&design).map(ExternalPtr::new))
+}
+
+#[extendr]
+fn solver_has_escalated_impl(solver: ExternalPtr<SolverHandle>) -> bool {
+    or_throw(solver.try_addr().map(|handle| handle.has_escalated()))
+}
+
 // ---------------------------------------------------------------------------
 // One-shot solve API
 // ---------------------------------------------------------------------------
@@ -44,13 +55,15 @@ fn solve_impl(design: Robj, y: &[f64], options: Robj, weights: Robj, preconditio
 
         match parse_preconditioner(preconditioner)? {
             PreconditionerArg::Config(config) => {
-                solve_native(design, y, weights, &lsmr, config.as_ref())
+                crate::threads::run(|| solve_native(design, y, weights, &lsmr, config.as_ref()))?
                     .map_err(|e| err(e.to_string()))
                     .and_then(result_to_list)
             }
-            PreconditionerArg::Built(built) => solve_native(design, y, weights, &lsmr, built)
-                .map_err(|e| err(e.to_string()))
-                .and_then(result_to_list),
+            PreconditionerArg::Built(built) => {
+                crate::threads::run(|| solve_native(design, y, weights, &lsmr, built))?
+                    .map_err(|e| err(e.to_string()))
+                    .and_then(result_to_list)
+            }
         }
     })())
 }
@@ -78,16 +91,16 @@ fn solve_batch_impl(
         let column_refs = matrix_columns(&y_matrix);
 
         match parse_preconditioner(preconditioner)? {
-            PreconditionerArg::Config(config) => {
+            PreconditionerArg::Config(config) => crate::threads::run(|| {
                 solve_batch_native(design, &column_refs, weights, &lsmr, config.as_ref())
-                    .map_err(|e| err(e.to_string()))
-                    .and_then(batch_result_to_list)
-            }
-            PreconditionerArg::Built(built) => {
+            })?
+            .map_err(|e| err(e.to_string()))
+            .and_then(batch_result_to_list),
+            PreconditionerArg::Built(built) => crate::threads::run(|| {
                 solve_batch_native(design, &column_refs, weights, &lsmr, built)
-                    .map_err(|e| err(e.to_string()))
-                    .and_then(batch_result_to_list)
-            }
+            })?
+            .map_err(|e| err(e.to_string()))
+            .and_then(batch_result_to_list),
         }
     })())
 }
@@ -100,14 +113,16 @@ fn solve_batch_impl(
 #[extendr]
 fn solver_new_impl(design: Robj, weights: Robj, preconditioner: Robj) -> ExternalPtr<SolverHandle> {
     or_throw((|| -> Result<ExternalPtr<SolverHandle>> {
-        let weights = extract_weights(weights)?;
+        let weights = weights_slice(&weights)?;
         let design = parse_design(&design)?;
 
         let solver = match parse_preconditioner(preconditioner)? {
             PreconditionerArg::Config(config) => {
-                NativeSolver::new(design, weights, config.as_ref())
+                crate::threads::run(|| NativeSolver::new(design, weights, config.as_ref()))?
             }
-            PreconditionerArg::Built(built) => NativeSolver::new(design, weights, built),
+            PreconditionerArg::Built(built) => {
+                crate::threads::run(|| NativeSolver::new(design, weights, built))?
+            }
         }
         .map_err(|e| err(e.to_string()))?;
 
@@ -120,9 +135,8 @@ fn solver_new_impl(design: Robj, weights: Robj, preconditioner: Robj) -> Externa
 fn solver_solve_impl(solver: ExternalPtr<SolverHandle>, y: &[f64], options: Robj) -> List {
     or_throw((|| -> Result<List> {
         let lsmr = parse_lsmr_options(&options)?;
-        solver
-            .try_addr()?
-            .solve(y, &lsmr)
+        let handle = solver.try_addr()?;
+        crate::threads::run(|| handle.solve(y, &lsmr))?
             .map_err(|e| err(e.to_string()))
             .and_then(result_to_list)
     })())
@@ -149,8 +163,7 @@ fn solver_solve_batch_impl(
 
         let column_refs = matrix_columns(&y_matrix);
 
-        handle
-            .solve_batch(&column_refs, &lsmr)
+        crate::threads::run(|| handle.solve_batch(&column_refs, &lsmr))?
             .map_err(|e| err(e.to_string()))
             .and_then(batch_result_to_list)
     })())
@@ -187,6 +200,8 @@ fn solver_n_obs_impl(solver: ExternalPtr<SolverHandle>) -> i32 {
 
 extendr_module! {
     mod api;
+    fn design_new_impl;
+    fn solver_has_escalated_impl;
     fn solve_impl;
     fn solve_batch_impl;
     fn solver_new_impl;

@@ -14,7 +14,8 @@ within_solve_batch(
 }
 \arguments{
 \item{design}{Either an integer category matrix of shape
-\verb{(n_obs, n_factors)} with 1-based labels, or a list of \code{\link[=Effect]{Effect()}} terms.}
+\verb{(n_obs, n_factors)} with 1-based labels, a list of \code{\link[=Effect]{Effect()}} terms,
+or a reusable \code{\link[=Design]{Design()}}.}
 
 \item{Y}{Numeric matrix of shape \verb{(n_obs, k)}.}
 
@@ -22,19 +23,24 @@ within_solve_batch(
 
 \item{weights}{Numeric vector of length \code{n_obs} or \code{NULL}.}
 
-\item{preconditioner}{Controls preconditioning. Five input forms are
-accepted: \code{NULL} builds the default additive Schwarz preconditioner,
+\item{preconditioner}{Controls preconditioning. The following input forms are
+accepted: \code{NULL} uses adaptive diagonal-to-Schwarz preconditioning,
 \code{PreconditionerConfig$Off} disables preconditioning,
 \code{PreconditionerConfig$Diagonal} uses diagonal/Jacobi scaling,
-\code{\link[=AdditiveSchwarz]{AdditiveSchwarz()}} overrides local-solver and reduction settings, and a
+\code{\link[=AdditiveSchwarz]{AdditiveSchwarz()}} builds Schwarz immediately, \code{\link[=Adaptive]{Adaptive()}} tunes the
+default adaptive strategy, and a
 built \code{\link[=Preconditioner]{Preconditioner()}} object reuses an existing factorization.}
 }
 \value{
 A named list with matrix fields \code{x} and \code{demeaned}, plus
-\code{unidentified}, \code{warnings}, \code{layout}, \code{converged},
-\code{iterations}, \code{residual}, \code{time_solve}, \code{time_setup}, and \code{time_total}.
+\code{unidentified}, \code{warnings}, \code{layout}, \code{converged}, \code{iterations},
+\code{residual}, \code{time_solve}, \code{time_setup}, and \code{time_total}.
 }
 \description{
 Builds the operator and preconditioner once, then solves for each column
 of \code{Y} in parallel.
+}
+\examples{
+groups <- cbind(c(1L, 1L, 2L, 2L), c(1L, 2L, 1L, 2L))
+within_solve_batch(groups, cbind(c(1, 3, 4, 8), c(2, 5, 1, 7)))$demeaned
 }

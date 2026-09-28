@@ -8,22 +8,26 @@ Solver(design, weights = NULL, preconditioner = NULL)
 }
 \arguments{
 \item{design}{Either an integer category matrix of shape
-\verb{(n_obs, n_factors)} with 1-based labels, or a list of \code{\link[=Effect]{Effect()}} terms.}
+\verb{(n_obs, n_factors)} with 1-based labels, a list of \code{\link[=Effect]{Effect()}} terms,
+or a reusable \code{\link[=Design]{Design()}}.}
 
 \item{weights}{Numeric vector of length \code{n_obs} or \code{NULL}.}
 
-\item{preconditioner}{Controls preconditioning. Five input forms are
-accepted: \code{NULL} builds the default additive Schwarz preconditioner,
+\item{preconditioner}{Controls preconditioning. The following input forms are
+accepted: \code{NULL} uses adaptive diagonal-to-Schwarz preconditioning,
 \code{PreconditionerConfig$Off} disables preconditioning,
 \code{PreconditionerConfig$Diagonal} uses diagonal/Jacobi scaling,
-\code{\link[=AdditiveSchwarz]{AdditiveSchwarz()}} overrides local-solver and reduction settings, and a
+\code{\link[=AdditiveSchwarz]{AdditiveSchwarz()}} builds Schwarz immediately, \code{\link[=Adaptive]{Adaptive()}} tunes the
+default adaptive strategy, and a
 built \code{\link[=Preconditioner]{Preconditioner()}} object reuses an existing factorization.}
 }
 \value{
 A \code{within_solver} object with \verb{$solve()}, \verb{$solve_batch()}, and
-\verb{$preconditioner()} methods, plus \verb{$n_dofs} and \verb{$n_obs} fields.
+\verb{$preconditioner()} and \verb{$has_escalated()} methods, plus \verb{$n_dofs} and \verb{$n_obs}
+fields. Native handles must be rebuilt after saving/loading an R session.
+A reused preconditioner must correspond to the same design and weights.
 }
 \description{
-Builds the preconditioner once and reuses it for repeated solves with the
-same design matrix.
+Retains the design and weight-dependent state across solves. Adaptive
+preconditioning builds Schwarz only if progress stalls, then reuses it.
 }

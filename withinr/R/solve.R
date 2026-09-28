@@ -12,6 +12,7 @@ validate_levels <- function(levels, name = "levels") {
 }
 
 validate_design <- function(design) {
+  if (inherits(design, "within_design")) return(design)
   if (is.matrix(design)) {
     return(matrix(
       validate_levels(design, "design"),
@@ -134,13 +135,14 @@ LsmrOptions <- function(tol = 1e-8, maxiter = 1000L, local_size = NULL) {
 #' Preconditioner shortcut values
 #'
 #' Use `PreconditionerConfig$Additive`, `PreconditionerConfig$Off`, or
-#' `PreconditionerConfig$Diagonal` as the `preconditioner` argument.
+#' `PreconditionerConfig$Diagonal`, or `PreconditionerConfig$Adaptive` as the
+#' `preconditioner` argument. `Adaptive` is the library default.
 #' `Additive` builds the default additive Schwarz preconditioner, `Off`
 #' disables preconditioning, and `Diagonal` uses diagonal/Jacobi scaling.
 #'
 #' @export
 PreconditionerConfig <- structure(
-  list(Additive = "additive", Off = "off", Diagonal = "diagonal"),
+  list(Adaptive = "adaptive", Additive = "additive", Off = "off", Diagonal = "diagonal"),
   class = "within_preconditioner_config"
 )
 
@@ -216,7 +218,7 @@ Schur <- structure(
 
 #' Signed-component scaling configuration
 #'
-#' @param tolerance Positive certification tolerance, or `NULL` for the
+#' @param tolerance Non-negative certification tolerance, or `NULL` for the
 #'   library default.
 #' @param max_iterations Positive reduced-CG iteration budget, or `NULL`.
 #' @param on_failure `ScalingFailure$Warn`, `ScalingFailure$Error`, or `NULL`.
@@ -286,19 +288,31 @@ AdditiveSchwarz <- function(local_solver = NULL,
 #' matrix implied by `design` and \eqn{W} is the diagonal weight matrix.
 #'
 #' @param design Either an integer category matrix of shape
-#'   `(n_obs, n_factors)` with 1-based labels, or a list of [Effect()] terms.
+#'   `(n_obs, n_factors)` with 1-based labels, a list of [Effect()] terms,
+#'   or a reusable [Design()].
 #' @param y Numeric vector of length `n_obs`.
 #' @param options `NULL` for default [LsmrOptions()] or an options object.
 #' @param weights Numeric vector of length `n_obs` or `NULL`.
-#' @param preconditioner Controls preconditioning. Five input forms are
-#'   accepted: `NULL` builds the default additive Schwarz preconditioner,
+#' @param preconditioner Controls preconditioning. The following input forms are
+#'   accepted: `NULL` uses adaptive diagonal-to-Schwarz preconditioning,
 #'   `PreconditionerConfig$Off` disables preconditioning,
 #'   `PreconditionerConfig$Diagonal` uses diagonal/Jacobi scaling,
-#'   [AdditiveSchwarz()] overrides local-solver and reduction settings, and a
+#'   [AdditiveSchwarz()] builds Schwarz immediately, [Adaptive()] tunes the
+#'   default adaptive strategy, and a
 #'   built [Preconditioner()] object reuses an existing factorization.
 #' @return A named list with fields `x`, `unidentified`, `warnings`, `layout`,
 #'   `demeaned`, `converged`, `iterations`, `residual`, `time_total`,
 #'   `time_setup`, and `time_solve`.
+#' @details Factor labels can have gaps. Coefficient addresses use the original
+#'   1-based labels. Check `converged` before using `demeaned`; `warnings` contains
+#'   diagnostic messages from native design and preconditioner construction.
+#'   Native computations use one worker thread by default (adaptive builds may
+#'   use a second). Set the environment
+#'   variable `WITHINR_NUM_THREADS` before the first call to change this limit.
+#' @examples
+#' groups <- cbind(c(1L, 1L, 2L, 2L), c(1L, 2L, 1L, 2L))
+#' fit <- within_solve(groups, c(1, 3, 4, 8))
+#' fit$demeaned
 #' @export
 within_solve <- function(design,
                          y,
@@ -322,6 +336,9 @@ within_solve <- function(design,
 #' @return A named list with matrix fields `x` and `demeaned`, plus
 #'   `unidentified`, `warnings`, `layout`, `converged`, `iterations`,
 #'   `residual`, `time_solve`, `time_setup`, and `time_total`.
+#' @examples
+#' groups <- cbind(c(1L, 1L, 2L, 2L), c(1L, 2L, 1L, 2L))
+#' within_solve_batch(groups, cbind(c(1, 3, 4, 8), c(2, 5, 1, 7)))$demeaned
 #' @export
 within_solve_batch <- function(design,
                                Y,
@@ -340,12 +357,14 @@ within_solve_batch <- function(design,
 
 #' Persistent fixed-effects solver
 #'
-#' Builds the preconditioner once and reuses it for repeated solves with the
-#' same design matrix.
+#' Retains the design and weight-dependent state across solves. Adaptive
+#' preconditioning builds Schwarz only if progress stalls, then reuses it.
 #'
 #' @inheritParams within_solve
 #' @return A `within_solver` object with `$solve()`, `$solve_batch()`, and
-#'   `$preconditioner()` methods, plus `$n_dofs` and `$n_obs` fields.
+#'   `$preconditioner()` and `$has_escalated()` methods, plus `$n_dofs` and `$n_obs`
+#'   fields. Native handles must be rebuilt after saving/loading an R session.
+#'   A reused preconditioner must correspond to the same design and weights.
 #' @export
 Solver <- function(design, weights = NULL, preconditioner = NULL) {
   design <- validate_design(design)
@@ -366,6 +385,7 @@ Solver <- function(design, weights = NULL, preconditioner = NULL) {
     Y <- matrix(as.double(Y), nrow = nrow(Y), ncol = ncol(Y))
     decorate_result(solver_solve_batch_impl(ptr, Y, options))
   }
+  solver$has_escalated <- function() solver_has_escalated_impl(ptr)
   solver$preconditioner <- function() {
     ptr <- solver_preconditioner_impl(solver$ptr)
     if (is.null(ptr)) {
@@ -398,7 +418,8 @@ new_preconditioner <- function(ptr) {
 #' Built preconditioner handle
 #'
 #' Deserializes a preconditioner from raw bytes produced by
-#' `solver$preconditioner()$serialize()`.
+#' `solver$preconditioner()$serialize()`. Bytes are specific to the native
+#' library's wire format and are not a permanent cross-version storage format.
 #'
 #' @param data Raw vector containing serialized preconditioner bytes.
 #' @return A `within_preconditioner` object with `$apply()` and `$serialize()`
@@ -437,4 +458,31 @@ print.within_coefficient_layout <- function(x, ...) {
     x$n_dofs
   ))
   invisible(x)
+}
+
+#' Reusable fixed-effects design
+#'
+#' Owns preprocessed observation storage independently of the R inputs. Share
+#' a design across solvers with different weights without repeating preprocessing.
+#' Rebuild this native handle after saving/loading an R session.
+#' @inheritParams within_solve
+#' @return A native design accepted wherever a category matrix is accepted.
+#' @export
+Design <- function(design) {
+  structure(list(ptr = design_new_impl(validate_design(design))), class = "within_design")
+}
+
+#' Adaptive diagonal-to-Schwarz preconditioning
+#'
+#' Starts with diagonal scaling and builds additive Schwarz only when progress
+#' stalls. This is the default strategy. A reused built preconditioner is fixed.
+#' @inheritParams AdditiveSchwarz
+#' @param window Positive number of consecutive stalled iterations.
+#' @param threshold Contraction threshold in `[0, 1)`.
+#' @return A preconditioner configuration object.
+#' @export
+Adaptive <- function(local_solver = NULL, reduction = ReductionStrategy$Auto,
+                     window = 4L, threshold = 0.7) {
+  structure(list(local_solver = local_solver, reduction = reduction,
+                 window = window, threshold = threshold), class = "within_adaptive")
 }

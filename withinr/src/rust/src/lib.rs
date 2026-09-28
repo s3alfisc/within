@@ -15,6 +15,7 @@ mod api;
 mod config;
 mod convert;
 mod results;
+mod threads;
 
 extendr_module! {
     mod withinr;

@@ -51,15 +51,7 @@ result = solve(fe, y, weights=np.ones(n))
 result = solve(fe, y, preconditioner=PreconditionerConfig.Diagonal())
 ```
 
-### R bindings
-
-The [`withinr`](withinr/) package exposes the Rust solver through generated
-[extendr](https://extendr.rs/) bindings. It supports weighted demeaning,
-batch responses, varying slopes, and reusable solvers and preconditioners.
-See [withinr/README.md](withinr/README.md) for the API and commands to regenerate
-all glue code and build an offline source package for CRAN.
-
-## FWL regression example
+### FWL regression example
 
 ```python
 beta_true = np.array([1.0, -2.0, 0.5])
@@ -179,6 +171,14 @@ as `.build_duration_seconds`; both are preserved across pickling and reuse.
 **`BatchSolveResult`**: Same fields, with `converged`, `iterations`, `residual`, and `time_solve` as lists (one entry per RHS).
 
 Coefficients for unidentified directions are pinned to the **minimal-norm** value `0` (never NaN). This is why `x` can differ from reference tools that instead drop a reference level; the identified fit — `demeaned` — is unaffected by the choice.
+
+## R bindings
+
+The [`withinr`](withinr/) package exposes the Rust solver through generated
+[extendr](https://extendr.rs/) bindings. It supports weighted demeaning,
+batch responses, varying slopes, and reusable solvers and preconditioners.
+See [withinr/README.md](withinr/README.md) for the API and commands to regenerate
+all glue code and build an offline source package for CRAN.
 
 ## Rust API
 

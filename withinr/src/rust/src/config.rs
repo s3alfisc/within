@@ -9,7 +9,7 @@ use extendr_api::{error::Result, prelude::*};
 
 use within::config::{
     ApproxCholConfig, ApproxSchurConfig, LocalSolverConfig, LsmrOptions, PreconditionerConfig,
-    ReductionStrategy, ScalingConfig, ScalingFailure, SchurMode,
+    ReductionStrategy, ScalingConfig, ScalingFailure, SchurMode, Staleness,
 };
 use within::Preconditioner;
 
@@ -150,7 +150,7 @@ fn parse_scaling_config(obj: &Robj) -> Result<ScalingConfig> {
     let tolerance = if tolerance_obj.is_null() {
         defaults.tolerance
     } else {
-        parse_positive_f64(&tolerance_obj, "scaling$tolerance")?
+        parse_nonnegative_f64(&tolerance_obj, "scaling$tolerance")?
     };
     let max_iterations = if max_iterations_obj.is_null() {
         defaults.max_iterations
@@ -239,8 +239,14 @@ fn parse_reduction_strategy(obj: &Robj) -> Result<ReductionStrategy> {
 
 fn parse_preconditioner_string(name: &str) -> Result<PreconditionerArg> {
     match name {
-        "additive" => Ok(PreconditionerArg::Config(Some(
+        "adaptive" => Ok(PreconditionerArg::Config(Some(
             PreconditionerConfig::default(),
+        ))),
+        "additive" => Ok(PreconditionerArg::Config(Some(
+            PreconditionerConfig::Additive {
+                local_solver: LocalSolverConfig::default(),
+                reduction: ReductionStrategy::default(),
+            },
         ))),
         "off" => Ok(PreconditionerArg::Config(Some(PreconditionerConfig::Off))),
         "diagonal" => Ok(PreconditionerArg::Config(Some(
@@ -274,6 +280,29 @@ pub(crate) fn parse_preconditioner(preconditioner: Robj) -> Result<Preconditione
         return parse_preconditioner_string(name);
     }
 
+    if preconditioner.inherits("within_adaptive") {
+        let window =
+            parse_nonnegative_integer(&get_field_or_null(&preconditioner, "window"), "window")?;
+        let threshold = parse_nonnegative_f64(
+            &get_field_or_null(&preconditioner, "threshold"),
+            "threshold",
+        )?;
+        let stall =
+            Staleness::try_new(window as usize, threshold).map_err(|e| err(e.to_string()))?;
+        return Ok(PreconditionerArg::Config(Some(
+            PreconditionerConfig::Adaptive {
+                local_solver: parse_local_solver_config(&get_field_or_null(
+                    &preconditioner,
+                    "local_solver",
+                ))?,
+                reduction: parse_reduction_strategy(&get_field_or_null(
+                    &preconditioner,
+                    "reduction",
+                ))?,
+                stall,
+            },
+        )));
+    }
     if preconditioner.inherits("within_additive_schwarz") {
         let local_solver =
             parse_local_solver_config(&get_field_or_null(&preconditioner, "local_solver"))?;
@@ -308,7 +337,7 @@ fn preconditioner_apply_impl(preconditioner: ExternalPtr<Preconditioner>, x: &[f
             )));
         }
         let mut y = vec![0.0; inner.nrows()];
-        inner.apply(x, &mut y).map_err(|e| err(e.to_string()))?;
+        crate::threads::run(|| inner.apply(x, &mut y))?.map_err(|e| err(e.to_string()))?;
         Ok(y)
     })())
 }
@@ -394,8 +423,8 @@ fn preconditioner_config_impl(preconditioner: ExternalPtr<Preconditioner>) -> Li
                 reduction,
             } => list!(
                 variant = variant,
-                local_solver = local_solver_to_list(local_solver),
-                reduction = reduction_name(*reduction)
+                local_solver = local_solver_to_list(&local_solver),
+                reduction = reduction_name(reduction)
             ),
             _ => list!(variant = variant),
         })

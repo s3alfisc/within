@@ -125,7 +125,7 @@ withinr_run_tests <- function(verbose = TRUE) {
   assert_equal(b$demeaned[, 2], s2$demeaned, tol = 1e-6, msg = "Batch demeaned RHS2 mismatch.")
 
   # Persistent Solver and Preconditioner reuse
-  solver <- withinr::Solver(cats_2x2)
+  solver <- withinr::Solver(cats_2x2, preconditioner = withinr::PreconditionerConfig$Additive)
   assert_true(inherits(solver, "within_solver"), "Solver() did not return a solver object.")
   assert_equal(solver$n_obs, 4L, msg = "solver$n_obs mismatch.")
   assert_true(solver$n_dofs >= 4L, "solver$n_dofs is too small.")
@@ -289,7 +289,62 @@ withinr_run_tests <- function(verbose = TRUE) {
     msg = "Unsorted batch input did not return demeaned values in caller order."
   )
 
-  if (verbose) message("withinr manual tests: OK")
+  # Independent weighted least-squares oracle (including rank-deficient dummies).
+  D <- do.call(cbind, lapply(seq_len(ncol(cats)), function(j) {
+    model.matrix(~ factor(cats[, j]) - 1)
+  }))
+  oracle <- lm.wfit(D, Y_big, w = weights)$residuals
+  assert_equal(batch_fresh$demeaned, oracle, tol = 1e-7,
+               msg = "Weighted demeaning differs from base R least squares.")
+
+  # Native designs own their inputs, preserve gappy caller labels, and may be
+  # reused with different weights and with a persistent solver.
+  gappy <- cats * 100L
+  design <- withinr::Design(gappy)
+  gappy[,] <- 1L
+  gc()
+  reused_design <- withinr::within_solve_batch(design, Y_big, weights = weights, options = tight)
+  assert_equal(reused_design$demeaned, oracle, tol = 1e-7)
+  assert_equal(reused_design$layout$address(1L)$level, 100L)
+  assert_equal(reused_design$layout$index(1L, 100L, 1L), 1L)
+  assert_error(reused_design$layout$index(1L, 1L, 1L), "out of range")
+  assert_equal(withinr::Solver(design)$solve(y, tight)$demeaned,
+               lm.fit(D, y)$residuals, tol = 1e-7)
+
+  # Adaptive starts with diagonal scaling; force a stall on this nontrivial
+  # fixture to exercise the deferred native build through the R boundary.
+  adaptive <- withinr::Solver(design, weights = weights,
+                              preconditioner = withinr::Adaptive(window = 1L, threshold = 0))
+  assert_true(!adaptive$has_escalated(), "Adaptive built Schwarz eagerly.")
+  assert_equal(adaptive$preconditioner()$config$variant, "Diagonal")
+  adaptive_result <- adaptive$solve(y, tight)
+  assert_true(adaptive_result$converged, "Adaptive failed to converge.")
+  assert_true(adaptive$has_escalated(), "Forced adaptive escalation did not occur.")
+  assert_equal(adaptive_result$demeaned, oracle[, 1], tol = 1e-7)
+  assert_equal(adaptive$preconditioner()$config$variant, "Additive")
+  assert_equal(withinr::Solver(cats_2x2)$preconditioner()$config$variant, "Diagonal")
+
+  # Varying slopes checked against an independently constructed dummy design.
+  z <- rnorm(n)
+  slope_design <- list(withinr::Effect(cats[, 1], slopes = z),
+                       withinr::Effect(cats[, 2]))
+  D1 <- model.matrix(~ factor(cats[, 1]) - 1)
+  D2 <- model.matrix(~ factor(cats[, 2]) - 1)
+  slope_oracle <- lm.wfit(cbind(D1, D1 * z, D2), Y_big, weights)$residuals
+  slope_result <- withinr::within_solve_batch(slope_design, Y_big, weights = weights, options = tight)
+  assert_all_converged(slope_result, "Varying slopes failed to converge.")
+  assert_equal(slope_result$demeaned, slope_oracle, tol = 1e-7)
+
+  assert_error(withinr::Solver(cats, preconditioner = withinr::Adaptive(window = 0)), "positive")
+  assert_error(withinr::Solver(cats, preconditioner = withinr::Adaptive(threshold = 1)), "threshold")
+  assert_error(withinr::within_solve(cats, y[-1]), "length")
+  assert_error(withinr::within_solve(cats, replace(y, 1, NA_real_)))
+  assert_error(withinr::within_solve(cats, y, weights = rep(-1, n)))
+  assert_error(withinr::Preconditioner(as.raw(c(1, 2, 3))))
+  restored <- unserialize(serialize(design, NULL))
+  assert_error(withinr::Solver(restored))
+
+  if (verbose) message("withinr tests: OK")
   invisible(TRUE)
 }
 

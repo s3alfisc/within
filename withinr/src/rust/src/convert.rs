@@ -94,17 +94,6 @@ pub(crate) fn get_field_or_null(obj: &Robj, field: &str) -> Robj {
     obj.dollar(field).unwrap_or_else(|_| nil_value())
 }
 
-/// Owned weights for the persistent solver (which stores them across solves).
-pub(crate) fn extract_weights(weights: Robj) -> Result<Option<Vec<f64>>> {
-    if weights.is_null() {
-        return Ok(None);
-    }
-    weights
-        .as_real_vector()
-        .map(Some)
-        .ok_or_else(|| err("weights must be a numeric vector or NULL"))
-}
-
 /// Borrowed weights for the one-shot paths (`NULL` → `None`), avoiding a copy.
 pub(crate) fn weights_slice(weights: &Robj) -> Result<Option<&[f64]>> {
     if weights.is_null() {
@@ -149,8 +138,7 @@ pub(crate) fn categories_view<'a>(
 fn categories_design(categories: &RMatrix<i32>) -> Result<Design<'static>> {
     let cats_u32 = cast_categories(categories.data())?;
     let cats = categories_view(categories, &cats_u32)?;
-    cats.into_design()
-        .map(Design::into_owned)
+    crate::threads::run(|| cats.into_design().map(Design::into_owned))?
         .map_err(|e| err(e.to_string()))
 }
 
@@ -212,6 +200,10 @@ fn parse_effect(obj: Robj, term: usize) -> Result<OwnedEffect> {
 /// design. Owning the columns keeps persistent solver handles independent of
 /// the lifetime and mutability of their originating R objects.
 pub(crate) fn parse_design(design: &Robj) -> Result<Design<'static>> {
+    if design.inherits("within_design") {
+        let ptr = ExternalPtr::<Design<'static>>::try_from(get_field_or_null(design, "ptr"))?;
+        return Ok(ptr.try_addr()?.clone());
+    }
     if design.is_matrix() {
         let categories = RMatrix::<i32>::try_from(design)
             .map_err(|_| err("design matrices must contain integer factor labels"))?;
@@ -238,7 +230,6 @@ pub(crate) fn parse_design(design: &Robj) -> Result<Design<'static>> {
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| err(e.to_string()))?;
 
-    Design::new(effects)
-        .map(Design::into_owned)
+    crate::threads::run(|| Design::new(effects).map(Design::into_owned))?
         .map_err(|e| err(e.to_string()))
 }

@@ -3,8 +3,11 @@
 \name{Schur}
 \alias{Schur}
 \title{Schur reduction modes}
+\usage{
+Schur
+}
 \description{
-Use \code{Schur$Approximate()} for sampled Schur reduction or
-\code{Schur$Exact} for the exact complement. \code{NULL} in
-\code{\link[=LocalSolverConfig]{LocalSolverConfig()}} selects the library default.
+Use \code{Schur$Approximate()} for sampled Schur reduction or \code{Schur$Exact} for
+the exact complement. \code{NULL} in \code{\link[=LocalSolverConfig]{LocalSolverConfig()}} selects the library
+default (approximate).
 }

@@ -2,17 +2,28 @@
 name = "withinr"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
 publish = false
 
 [lib]
-crate-type = ["staticlib"]
+crate-type = ["rlib", "staticlib"]
+
+[[bin]]
+name = "document"
+path = "document.rs"
 
 # Detach from the repo root workspace to avoid nested-workspace Cargo errors.
 [workspace]
+exclude = ["within-core"]
 
 [dependencies]
 extendr-api = "0.9"
 ndarray = "0.17"
+rayon = "1.12"
 postcard = { version = "1.1", features = ["use-std"] }
 
-within = "0.4.0"
+within = { path = "within-core/crates/within" }
+
+[profile.release]
+lto = true
+codegen-units = 1

@@ -1,7 +1,8 @@
 # Basic withinr usage.
 #
 # Run from the repository root after installing the package:
-#   NOT_CRAN=true R CMD INSTALL withinr
+#   Rscript scripts/prepare-r-package.R --vendor
+#   R CMD INSTALL withinr
 #   Rscript withinr/examples/basic_withinr_usage.R
 
 if (!requireNamespace("withinr", quietly = TRUE)) {
