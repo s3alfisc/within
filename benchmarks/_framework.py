@@ -26,7 +26,6 @@ from within._within import (
     ApproxCholConfig,
     ApproxSchurConfig,
     Schur,
-    ReductionStrategy,
     LocalSolverConfig,
 )
 
@@ -197,15 +196,6 @@ def benchmark_lsmr(
     )
 
 
-def make_additive_schwarz(
-    local_solver: LocalSolverConfig,
-) -> PreconditionerConfig.Additive:
-    """Construct additive Schwarz using the default Auto reduction mode."""
-    return PreconditionerConfig.Additive(
-        local_solver=local_solver, reduction=ReductionStrategy.Auto
-    )
-
-
 def standard_solver_configs(
     opts: Any, *, maxiter: int | None = None
 ) -> list[SolverConfig]:
@@ -217,24 +207,24 @@ def standard_solver_configs(
     """
     schur = LocalSolverConfig(
         approx_chol=ApproxCholConfig(seed=opts.seed),
-        schur=Schur.approximate(ApproxSchurConfig(seed=opts.seed)),
+        schur=Schur.approximate(ApproxSchurConfig()),
     )
     # "2-2": both densification knobs on — split_merge=2 (AC2 reduced-system
     # factorization) and split=2 (denser Schur clique-tree sampling).
     schur_2_2 = LocalSolverConfig(
         approx_chol=ApproxCholConfig(seed=opts.seed, split_merge=2),
-        schur=Schur.approximate(ApproxSchurConfig(seed=opts.seed, split=2)),
+        schur=Schur.approximate(ApproxSchurConfig(split=2)),
     )
     return [
         SolverConfig(
             "LSMR(Schwarz)",
             benchmark_lsmr(opts, maxiter=maxiter),
-            preconditioner=make_additive_schwarz(local_solver=schur),
+            preconditioner=PreconditionerConfig.Additive(local_solver=schur),
         ),
         SolverConfig(
             "LSMR(Schwarz,2-2)",
             benchmark_lsmr(opts, maxiter=maxiter),
-            preconditioner=make_additive_schwarz(local_solver=schur_2_2),
+            preconditioner=PreconditionerConfig.Additive(local_solver=schur_2_2),
         ),
     ]
 

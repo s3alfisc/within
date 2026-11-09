@@ -2,8 +2,7 @@ use ndarray::array;
 use rstest::rstest;
 use within::{
     solve, ApproxCholConfig, ApproxSchurConfig, Effect, LocalSolverConfig, LsmrOptions,
-    Preconditioner, PreconditionerConfig, ReductionStrategy, ScalingConfig, ScalingFailure,
-    SchurMode, Solver,
+    Preconditioner, PreconditionerConfig, ScalingConfig, ScalingFailure, SchurMode, Solver,
 };
 
 #[path = "common/orchestrate_helpers.rs"]
@@ -194,21 +193,18 @@ fn fully_specified_additive() -> PreconditionerConfig {
                 seed: 41,
                 split_merge: Some(3),
             },
-            schur: SchurMode::Approximate(ApproxSchurConfig { seed: 17, split: 2 }),
+            schur: SchurMode::Approximate(ApproxSchurConfig { split: 2 }),
             dense_threshold: 0,
             scaling: ScalingConfig {
                 tolerance: 1e-7,
                 max_iterations: 123,
                 on_failure: ScalingFailure::Error,
             },
-            ridge: 1e-5,
         },
-        reduction: ReductionStrategy::AtomicScatter,
     }
 }
 
-/// The ladder is not a map — its serialized form is whichever rung it holds — so the axis is
-/// the two variants that build one eagerly.
+/// A solved ladder hands out whichever rung it reached, so the axis is the two eager variants.
 #[rstest]
 #[case::diagonal(PreconditionerConfig::Diagonal)]
 #[case::additive(fully_specified_additive())]
@@ -266,18 +262,12 @@ fn test_solver_accepts_prebuilt_design() {
     assert!(result.converged);
 }
 
-/// The construction-time locality sort must be transparent: coefficients are
-/// permutation-invariant and `demeaned` comes back in caller order. The sort
-/// is applied to every frame by `Design::from_frame`, so the oracle is built
-/// via `from_frame_unsorted`, the explicit caller-order escape hatch. Results
-/// agree within solver tolerance, not bitwise: the paths sum in different
-/// row orders. The weighted run also exercises the weights-permutation path.
+/// Locality sort vs. the `new_unsorted` oracle: equal within tolerance, as row order differs.
 #[rstest]
 #[case::unweighted(false)]
 #[case::weighted(true)]
 fn test_internal_locality_sort_is_transparent(#[case] weighted: bool) {
-    use within::observation::ObservationFrame;
-    use within::Design;
+    use within::{Design, Effect};
 
     // Factor 0 (4 levels) is the dominant factor and is non-monotonic.
     let col0: Vec<u32> = vec![3, 0, 2, 1, 3, 0, 2, 1, 3, 0, 2, 1];
@@ -299,10 +289,11 @@ fn test_internal_locality_sort_is_transparent(#[case] weighted: bool) {
         Solver::new(design, weights, &precond).expect("solver")
     };
     let make_oracle = |weights: Option<&[f64]>| {
-        let frame =
-            ObservationFrame::new(vec![col0.clone().into(), col1.clone().into()], Vec::new())
-                .expect("frame");
-        let design = Design::from_frame_unsorted(frame).expect("oracle design");
+        let design = Design::new_unsorted(vec![
+            Effect::new(&col0, true, []).expect("effect 0"),
+            Effect::new(&col1, true, []).expect("effect 1"),
+        ])
+        .expect("oracle design");
         Solver::new(design, weights, &precond).expect("oracle solver")
     };
 
@@ -314,4 +305,35 @@ fn test_internal_locality_sort_is_transparent(#[case] weighted: bool) {
         .expect("sorted");
     common::assert_solutions_close(&sorted.x, &oracle.x, 1e-7);
     common::assert_solutions_close(&sorted.demeaned, &oracle.demeaned, 1e-7);
+}
+
+/// `demeaned` is `y − D x` for the returned `x`, whichever exit produced it.
+#[rstest]
+fn test_demeaned_equals_residual_of_returned_x(
+    #[values(
+        PreconditionerConfig::Off,
+        PreconditionerConfig::Diagonal,
+        common::additive(),
+        common::adaptive()
+    )]
+    precond: PreconditionerConfig,
+    #[values(
+        None,
+        Some(vec![1.0; 5]),
+        Some(vec![0.5, 2.0, 1.0, 3.0, 0.25]),
+        Some(vec![0.0, 2.0, 1.0, 3.0, 0.25])
+    )]
+    weights: Option<Vec<f64>>,
+) {
+    let (categories, y) = categories_and_y();
+    let result = solve(
+        categories.view(),
+        &y,
+        weights.as_deref(),
+        &default_params(),
+        &precond,
+    )
+    .expect("solve");
+
+    common::assert_demeaned_is_residual(categories.view(), &y, &result, 1e-12);
 }

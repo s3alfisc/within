@@ -3,7 +3,6 @@ use std::error::Error;
 use ndarray::Array2;
 use rstest::rstest;
 use schwarz_precond::SolveError;
-use within::observation::ObservationFrame;
 use within::{
     solve, solve_batch, BuildError, Design, Effect, LocalSolverConfig, LsmrOptions,
     PreconditionerConfig, Solver, Staleness, WithinError,
@@ -13,10 +12,8 @@ use within::{
 
 #[test]
 fn test_empty_observations_error() {
-    // A zero-row frame is valid; EmptyObservations is raised by Design::from_frame.
-    let frame =
-        ObservationFrame::new(vec![vec![].into(), vec![].into()], Vec::new()).expect("frame ok");
-    let result = Design::from_frame(frame);
+    let empty = Effect::new(&[], true, []).expect("zero-row effect ok");
+    let result = Design::new(vec![empty.clone(), empty]);
     assert!(result.is_err());
     match result.unwrap_err() {
         BuildError::EmptyObservations => {}
@@ -26,14 +23,16 @@ fn test_empty_observations_error() {
 
 #[test]
 fn test_observation_count_mismatch_error() {
-    // Factor columns have different lengths
-    let result = ObservationFrame::new(
-        vec![vec![0u32, 1, 2].into(), vec![0u32, 1].into()],
-        Vec::new(),
-    );
-    assert!(result.is_err());
+    let result = Design::new(vec![
+        Effect::new(&[0, 1, 2], true, []).expect("effect 0"),
+        Effect::new(&[0, 1], true, []).expect("effect 1"),
+    ]);
     match result.unwrap_err() {
-        BuildError::ObservationCountMismatch { .. } => {}
+        BuildError::ObservationCountMismatch {
+            column: 1,
+            expected: 3,
+            got: 2,
+        } => {}
         other => panic!("Expected ObservationCountMismatch, got: {:?}", other),
     }
 }
@@ -41,12 +40,11 @@ fn test_observation_count_mismatch_error() {
 #[test]
 fn test_weight_count_mismatch_error() {
     // Weights of wrong length are caught at Solver construction time.
-    let frame = ObservationFrame::new(
-        vec![vec![0u32, 1, 2].into(), vec![0u32, 1, 0].into()],
-        Vec::new(),
-    )
-    .expect("frame ok");
-    let design = Design::from_frame(frame).expect("valid design");
+    let design = Design::new(vec![
+        Effect::new(&[0, 1, 2], true, []).expect("effect 0"),
+        Effect::new(&[0, 1, 0], true, []).expect("effect 1"),
+    ])
+    .expect("valid design");
     let result = Solver::new(design, Some(&[1.0, 2.0]), None);
     let err = result.expect_err("expected WeightCountMismatch error, got Ok");
     match err {
@@ -186,7 +184,10 @@ fn test_within_error_from_build_error() {
 
 #[test]
 fn test_within_error_from_solve_error() {
-    let inner = SolveError::Synchronization { context: "test" };
+    let inner = SolveError::InvalidInput {
+        context: "test",
+        message: "test".to_string(),
+    };
     let e: WithinError = inner.into();
     match e {
         WithinError::Solve(_) => {}
@@ -197,18 +198,12 @@ fn test_within_error_from_solve_error() {
 #[test]
 fn test_within_error_source_chains_through_transparent_wrapper() {
     // Transparent: WithinError -> BuildError::Preconditioner -> schwarz_precond::BuildError
-    let inner = schwarz_precond::BuildError::ScratchSizeTooSmall {
-        scratch_size: 1,
-        required_min: 2,
+    let inner = schwarz_precond::BuildError::LocalDofCountMismatch {
+        index_count: 1,
+        solver_n_local: 2,
     };
     let e = WithinError::Build(BuildError::Preconditioner(inner));
     assert!(e.source().is_some());
-}
-
-#[derive(Debug, Clone, Copy)]
-enum InvalidField {
-    Ridge,
-    Tolerance,
 }
 
 /// Adaptive defers the build that would reject these, and with a single factor never runs it.
@@ -216,39 +211,29 @@ enum InvalidField {
 /// silently — no `UnscalableComponent` under `Error`, and no `BuildWarning` under `Warn` either.
 #[rstest]
 fn test_invalid_local_solver_rejected(
-    #[values(-1e-9, f64::NAN, f64::INFINITY)] value: f64,
-    #[values(InvalidField::Ridge, InvalidField::Tolerance)] field: InvalidField,
+    #[values(-1e-9, 1.0, f64::NAN, f64::INFINITY)] value: f64,
     #[values(false, true)] adaptive: bool,
     #[values(1, 2)] n_factors: usize,
 ) {
     let f = [0u32, 0, 1, 1];
     let g = [0u32, 1, 0, 1];
     let mut local_solver = LocalSolverConfig::default();
-    match field {
-        InvalidField::Ridge => local_solver.ridge = value,
-        InvalidField::Tolerance => local_solver.scaling.tolerance = value,
-    }
+    local_solver.scaling.tolerance = value;
     let precond = if adaptive {
         PreconditionerConfig::Adaptive {
             local_solver,
-            reduction: Default::default(),
             stall: Staleness::try_new(4, 0.9).expect("stall"),
         }
     } else {
-        PreconditionerConfig::Additive {
-            local_solver,
-            reduction: Default::default(),
-        }
+        PreconditionerConfig::Additive { local_solver }
     };
     let mut effects = vec![Effect::new(&f, true, []).expect("f")];
     if n_factors == 2 {
         effects.push(Effect::new(&g, true, []).expect("g"));
     }
     let err = Solver::new(effects, None, &precond).expect_err("rejected");
-    let rejected = match (field, &err) {
-        (InvalidField::Ridge, BuildError::InvalidRidge { value }) => *value,
-        (InvalidField::Tolerance, BuildError::InvalidScalingTolerance { value }) => *value,
-        _ => panic!("expected an invalid {field:?}, got {err:?}"),
+    let BuildError::InvalidScalingTolerance { value: rejected } = err else {
+        panic!("expected an invalid tolerance, got {err:?}");
     };
     assert_eq!(rejected.to_bits(), value.to_bits());
 }

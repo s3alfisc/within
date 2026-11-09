@@ -82,7 +82,7 @@ $$
 |---|---|
 | **G∘** | PSD; channels orthogonal within each level (slope channels orthonormal); cross-factor blocks bipartite, assembled from rank-1 stamps $w\,\tilde c_f \tilde c_g^\top$ |
 | **P** | connected principal submatrix on *all* channels of two factors ≃ matrix-weighted bipartite Laplacian, rank-1 PSD block weights |
-| **B** | member: one channel per factor, one connected component; $\begin{bmatrix} D_q & C \\ C^\top & D_r \end{bmatrix}$, $D$ diagonal, $C$ signed |
+| **B** | member: one channel per factor, one connected component or a one-sided batch of isolated levels ($C = 0$); $\begin{bmatrix} D_q & C \\ C^\top & D_r \end{bmatrix}$, $D$ diagonal, $C$ signed |
 | **S±** | signed SDD; row surplus explicit as ground-edge weight |
 | **L₊** | grounded Laplacian ≡ SDDM; *floating* ($\ker = \mathbf{1}$) or *grounded* (PD) |
 | **𝓛** | $\mathcal{L}\mathcal{L}^\top = X$ [exact] or $\mathbb{E}[\mathcal{L}\mathcal{L}^\top] = X$ [sampled], $X$ the source; rank = source, surely |
@@ -105,8 +105,8 @@ it).
 | validate | plain B → L₊ | check row sums ≡ diagonals (roundoff); adopt $\sigma = (\mathbf{1}_q, -\mathbf{1}_r)$ | exact | $x = \sigma \circ \hat x$ |
 | scale | dominant B → S± | $A \mapsto SAS$, $S$ certified by conjugate gradients on the reduced operator | exact | $x = S\hat x$ |
 | clamp | ¬dominant B → S± | diagonal lift $d_i \mapsto \max\bigl(d_i, \sum_j \lvert a_{ij}\rvert\bigr)$ — operator perturbation | quality | — |
-| switch | balanced S± → L₊ | $A \mapsto \sigma A \sigma$, fused with scale; surplus → ground edges; floating ⟺ total surplus ≤ roundoff | exact | $x = \sigma \circ \hat x$ |
-| cover | frustrated S± → L₊ ($2n$) | Gremban double cover; balanced ⟺ cover disconnects | exact | $x = (x^+ - x^-)/2$ |
+| switch | balanced S± → L₊ | $A \mapsto \sigma A \sigma$, fused with scale; surplus → ground edges; floating ⟺ $f^\top G f \le 10u\,f^\top D f$ at the signed scaling $f$, summed over observations | exact | $x = \sigma \circ \hat x$ |
+| cover | frustrated S± → L₊ ($2n$) | Gremban double cover; balanced ⟺ cover disconnects; always grounded: a frustrated block is nonsingular | exact | $x = (x^+ - x^-)/2$ |
 | eliminate | L₊ → L₊ | Schur on the larger bipartite side: independent set ⇒ pivots = original diagonals; ground kept; eliminated surplus joins its star (capacity = pivot) | exact rows / sampled per-star clique-tree (unbiased, kernel sure, no spectral guarantee; exact on ≤ 2-entry stars) | back-substitution |
 | factor | L₊ → 𝓛 | clique-tree to completion (ground ordinary) / dense Cholesky (floating: anchored minor = grounding, benign) | sampled / exact | substitution |
 | pseudo-solve | 𝓛 → B⁺ | compose pullbacks in reverse; floating: mean-project RHS and solution; grounded: gauge $(b, -\mathbf{1}^\top b)$, $x = \hat x - \hat x_g$ | — | is the pullback |
@@ -244,8 +244,9 @@ theorem is Kyng–Sachdeva's heavier sampler.
 $\ker(M) = \bigcap_i \ker$ of the member terms: a direction survives ⟺ it
 touches no grounded member and every floating member it touches sees its own
 indicator (uncovered DOFs survive trivially, and lie in $\ker(A)$). So the
-floating/grounded call at **switch** is the single decision selecting the
-table row. Quality errors in $M$ cost visible iterations; range errors change
+floating/grounded call, read from the observations, is the
+single decision selecting the table row. Quality errors in $M$ cost visible
+iterations; range errors change
 which problem is solved, invisibly.
 
 ## Status

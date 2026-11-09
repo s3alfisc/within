@@ -4,12 +4,15 @@
 //! Python→native config conversions (`to_native`, `resolve_precond_input`,
 //! `resolve_lsmr_config`). The low-level classes are exposed for benchmark tuning.
 
+// `#[pyclass(from_py_object)]` expands to `.clone()` on the `Copy` config classes.
+#![allow(clippy::clone_on_copy)]
+
 use numpy::PyReadonlyArray1;
 use pyo3::prelude::*;
 
 use within::config::{
     ApproxCholConfig, ApproxSchurConfig, LocalSolverConfig, LsmrOptions, PreconditionerConfig,
-    ReductionStrategy, ScalingConfig, ScalingFailure, SchurMode, Staleness,
+    ScalingConfig, ScalingFailure, SchurMode, Staleness,
 };
 use within::{Preconditioner, PreconditionerInput};
 
@@ -53,31 +56,26 @@ impl PyApproxCholConfig {
 #[pyo3(name = "ApproxSchurConfig")]
 pub struct PyApproxSchurConfig {
     #[pyo3(get)]
-    pub seed: u64,
-    #[pyo3(get)]
     pub split: u32,
 }
 
 #[pymethods]
 impl PyApproxSchurConfig {
     #[new]
-    #[pyo3(signature = (seed=0, split=1))]
-    fn new(seed: u64, split: u32) -> PyResult<Self> {
+    #[pyo3(signature = (split=1))]
+    fn new(split: u32) -> PyResult<Self> {
         if split == 0 {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "split must be >= 1",
             ));
         }
-        Ok(Self { seed, split })
+        Ok(Self { split })
     }
 }
 
 impl PyApproxSchurConfig {
     pub(crate) fn to_native(&self) -> ApproxSchurConfig {
-        ApproxSchurConfig {
-            seed: self.seed,
-            split: self.split,
-        }
+        ApproxSchurConfig { split: self.split }
     }
 }
 
@@ -114,7 +112,7 @@ impl PySchur {
     fn __repr__(&self) -> String {
         match &self.inner {
             SchurMode::Approximate(cfg) => {
-                format!("Schur.approximate(seed={}, split={})", cfg.seed, cfg.split)
+                format!("Schur.approximate(split={})", cfg.split)
             }
             SchurMode::Exact => "Schur.exact()".to_string(),
         }
@@ -207,23 +205,17 @@ impl PyScalingConfig {
 #[derive(PartialEq)]
 pub enum PyPreconditionerConfig {
     Off(),
-    #[pyo3(constructor = (
-        local_solver=PyLocalSolverConfig::default(),
-        reduction=PyReductionStrategy::Auto
-    ))]
+    #[pyo3(constructor = (local_solver=PyLocalSolverConfig::default()))]
     Additive {
         local_solver: PyLocalSolverConfig,
-        reduction: PyReductionStrategy,
     },
     Diagonal(),
     #[pyo3(constructor = (
         local_solver=PyLocalSolverConfig::default(),
-        reduction=PyReductionStrategy::Auto,
         stall=PyStaleness::default()
     ))]
     Adaptive {
         local_solver: PyLocalSolverConfig,
-        reduction: PyReductionStrategy,
         stall: PyStaleness,
     },
 }
@@ -233,20 +225,14 @@ impl PyPreconditionerConfig {
         match self {
             Self::Off() => PreconditionerConfig::Off,
             Self::Diagonal() => PreconditionerConfig::Diagonal,
-            Self::Additive {
-                local_solver,
-                reduction,
-            } => PreconditionerConfig::Additive {
+            Self::Additive { local_solver } => PreconditionerConfig::Additive {
                 local_solver: local_solver.to_native(),
-                reduction: reduction.to_native(),
             },
             Self::Adaptive {
                 local_solver,
-                reduction,
                 stall,
             } => PreconditionerConfig::Adaptive {
                 local_solver: local_solver.to_native(),
-                reduction: reduction.to_native(),
                 stall: stall.to_native(),
             },
         }
@@ -256,12 +242,15 @@ impl PyPreconditionerConfig {
         Ok(match config {
             PreconditionerConfig::Off => Self::Off(),
             PreconditionerConfig::Diagonal => Self::Diagonal(),
-            PreconditionerConfig::Additive {
-                local_solver,
-                reduction,
-            } => Self::Additive {
+            PreconditionerConfig::Additive { local_solver } => Self::Additive {
                 local_solver: PyLocalSolverConfig::from_native(local_solver),
-                reduction: PyReductionStrategy::from_native(*reduction),
+            },
+            PreconditionerConfig::Adaptive {
+                local_solver,
+                stall,
+            } => Self::Adaptive {
+                local_solver: PyLocalSolverConfig::from_native(local_solver),
+                stall: PyStaleness { inner: *stall },
             },
             _ => {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -320,33 +309,6 @@ impl PyStaleness {
     }
 }
 
-#[pyclass(frozen, eq, eq_int, from_py_object, module = "within._within")]
-#[pyo3(name = "ReductionStrategy")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PyReductionStrategy {
-    Auto = 0,
-    AtomicScatter = 1,
-    ParallelReduction = 2,
-}
-
-impl PyReductionStrategy {
-    pub(crate) fn from_native(strategy: ReductionStrategy) -> Self {
-        match strategy {
-            ReductionStrategy::Auto => Self::Auto,
-            ReductionStrategy::AtomicScatter => Self::AtomicScatter,
-            ReductionStrategy::ParallelReduction => Self::ParallelReduction,
-        }
-    }
-
-    pub(crate) fn to_native(self) -> ReductionStrategy {
-        match self {
-            Self::Auto => ReductionStrategy::Auto,
-            Self::AtomicScatter => ReductionStrategy::AtomicScatter,
-            Self::ParallelReduction => ReductionStrategy::ParallelReduction,
-        }
-    }
-}
-
 #[pyclass(frozen, eq, from_py_object, module = "within._within")]
 #[pyo3(name = "LocalSolverConfig")]
 #[derive(Clone, Default, PartialEq)]
@@ -357,14 +319,13 @@ pub struct PyLocalSolverConfig {
 #[pymethods]
 impl PyLocalSolverConfig {
     #[new]
-    #[pyo3(signature = (approx_chol=None, schur=None, dense_threshold=None, scaling=None, ridge=None))]
+    #[pyo3(signature = (approx_chol=None, schur=None, dense_threshold=None, scaling=None))]
     fn new(
         py: Python<'_>,
         approx_chol: Option<Py<PyApproxCholConfig>>,
         schur: Option<Py<PySchur>>,
         dense_threshold: Option<usize>,
         scaling: Option<Py<PyScalingConfig>>,
-        ridge: Option<f64>,
     ) -> Self {
         let defaults = LocalSolverConfig::default();
         Self {
@@ -379,7 +340,6 @@ impl PyLocalSolverConfig {
                 scaling: scaling
                     .map(|config| config.bind(py).get().to_native())
                     .unwrap_or(defaults.scaling),
-                ridge: ridge.unwrap_or(defaults.ridge),
             },
         }
     }
@@ -402,11 +362,6 @@ impl PyLocalSolverConfig {
     #[getter]
     fn scaling(&self) -> PyScalingConfig {
         PyScalingConfig::from_native(&self.inner.scaling)
-    }
-
-    #[getter]
-    fn ridge(&self) -> f64 {
-        self.inner.ridge
     }
 }
 

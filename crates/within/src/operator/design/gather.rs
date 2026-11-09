@@ -3,7 +3,6 @@
 use rayon::prelude::*;
 
 use super::PAR_THRESHOLD;
-use crate::domain::Loading;
 use crate::domain::PreparedDesign;
 
 /// Gather-apply `dst[i] = Σ_t Σ_c src[…] · loading_c(i)`, times `scale[i]` when given.
@@ -20,49 +19,57 @@ pub(crate) fn gather_apply(
 
     dst.fill(0.0);
 
-    let frame = &design.frame;
     for_each_chunk(dst, |chunk, row_start| {
-        for (q, t) in design.terms.iter().enumerate() {
-            let (offset, n_levels) = (t.offset, t.n_levels());
-            let levels = frame.level_column(q);
-            let col = |c: usize| &src[offset + c * n_levels..offset + (c + 1) * n_levels];
-            match &*t.columns {
-                [Loading::Constant] => gather_term(chunk, row_start, levels, [col(0)], |_| [1.0]),
-                [Loading::Constant, Loading::Covariate(c0)] => {
-                    let z0 = prepared.loading_column(*c0 as usize);
+        for t in prepared.terms() {
+            let (offset, n_levels, levels) = (t.term.offset, t.term.n_levels(), t.term.levels());
+            let col = |c: usize| &src[t.term.column_dofs(c)];
+            match (t.term.intercept, t.slopes) {
+                (true, []) => gather_term(chunk, row_start, levels, [col(0)], |_| [1.0]),
+                (true, [z0]) => {
+                    let z0 = &z0[..];
                     gather_term(chunk, row_start, levels, [col(0), col(1)], |i| [1.0, z0[i]])
                 }
-                [Loading::Constant, Loading::Covariate(c0), Loading::Covariate(c1)] => {
-                    let z0 = prepared.loading_column(*c0 as usize);
-                    let z1 = prepared.loading_column(*c1 as usize);
+                (true, [z0, z1]) => {
+                    let (z0, z1) = (&z0[..], &z1[..]);
                     gather_term(chunk, row_start, levels, [col(0), col(1), col(2)], |i| {
                         [1.0, z0[i], z1[i]]
                     })
                 }
-                [Loading::Covariate(c0), Loading::Covariate(c1)] => {
-                    let z0 = prepared.loading_column(*c0 as usize);
-                    let z1 = prepared.loading_column(*c1 as usize);
+                (true, [z0, z1, z2]) => {
+                    let (z0, z1, z2) = (&z0[..], &z1[..], &z2[..]);
+                    let cols = [col(0), col(1), col(2), col(3)];
+                    gather_term(chunk, row_start, levels, cols, |i| {
+                        [1.0, z0[i], z1[i], z2[i]]
+                    })
+                }
+                (false, [z0, z1]) => {
+                    let (z0, z1) = (&z0[..], &z1[..]);
                     gather_term(chunk, row_start, levels, [col(0), col(1)], |i| {
                         [z0[i], z1[i]]
                     })
                 }
-                [Loading::Covariate(c0)] => {
-                    let z0 = prepared.loading_column(*c0 as usize);
+                (false, [z0, z1, z2]) => {
+                    let (z0, z1, z2) = (&z0[..], &z1[..], &z2[..]);
+                    gather_term(chunk, row_start, levels, [col(0), col(1), col(2)], |i| {
+                        [z0[i], z1[i], z2[i]]
+                    })
+                }
+                (false, [z0]) => {
+                    let z0 = &z0[..];
                     gather_term(chunk, row_start, levels, [col(0)], |i| [z0[i]])
                 }
-                columns => {
+                (intercept, slopes) => {
                     // A dynamic column count cannot monomorphize a fixed arity.
+                    let first = intercept as usize;
                     for (local, dst_val) in chunk.iter_mut().enumerate() {
                         let i = row_start + local;
                         let lev = levels[i] as usize;
                         let mut acc = 0.0;
-                        for (c, loading) in columns.iter().enumerate() {
+                        for c in 0..t.term.n_columns() {
                             let coef = src[offset + c * n_levels + lev];
-                            acc += match loading {
-                                Loading::Constant => coef,
-                                Loading::Covariate(k) => {
-                                    coef * prepared.loading_column(*k as usize)[i]
-                                }
+                            acc += match c.checked_sub(first) {
+                                None => coef,
+                                Some(j) => coef * slopes[j][i],
                             };
                         }
                         *dst_val += acc;
@@ -74,6 +81,16 @@ pub(crate) fn gather_apply(
             for (s, dst_val) in scale[row_start..].iter().zip(chunk.iter_mut()) {
                 *dst_val *= s;
             }
+        }
+    });
+}
+
+/// Divide an observation-space vector row-wise, undoing the `scale` [`gather_apply`] applied.
+pub(crate) fn unscale(dst: &mut [f64], scale: &[f64]) {
+    debug_assert_eq!(dst.len(), scale.len());
+    for_each_chunk(dst, |chunk, row_start| {
+        for (d, &s) in chunk.iter_mut().zip(&scale[row_start..]) {
+            *d /= s;
         }
     });
 }

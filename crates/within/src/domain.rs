@@ -1,90 +1,38 @@
 //! Domain layer: [`Design`] (design-matrix metadata) and factor-pair [`Subdomain`] construction.
 
-pub(crate) mod collinearity;
-pub(crate) mod cross_tab;
 mod effect;
 pub(crate) mod factor_pairs;
 mod level_moments;
 mod prepared;
 mod reparam;
+mod scatter_split;
 
-pub(crate) use cross_tab::{BlockDiagonals, CrossTab};
-pub(crate) use level_moments::{BasisScratch, RANK_TOL};
-pub(crate) use prepared::PreparedDesign;
-use reparam::SlopeReparam;
+pub(crate) use prepared::{PreparedDesign, PreparedTerm};
+use reparam::TermReparam;
+pub(crate) use scatter_split::{LevelRows, ScatterSplit};
 
 pub use effect::Effect;
 
-pub(crate) use factor_pairs::{
-    build_local_domains, CoordinateMap, Grounding, LocalComponent, LocalDomain, MatrixForm,
-    SddmMatrix,
-};
-
-use std::borrow::Cow;
-use std::collections::HashMap;
-use std::sync::Arc;
-
-use ndarray::{ArrayView2, Axis};
+pub(crate) use factor_pairs::{build_local_domains, LocalDomain};
 
 use crate::channel::Channel;
-use crate::observation::ObservationFrame;
 use crate::BuildError;
+use ndarray::{ArrayView2, Axis};
+use rayon::prelude::*;
+use rustc_hash::FxBuildHasher;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
+use std::sync::Arc;
 
-/// A slice that is guaranteed non-empty by construction.
-#[repr(transparent)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NonEmpty<T>(Box<[T]>);
-
-impl<T> NonEmpty<T> {
-    /// `None` if `items` is empty.
-    pub fn new(items: impl Into<Box<[T]>>) -> Option<Self> {
-        let items = items.into();
-        (!items.is_empty()).then(|| Self(items))
-    }
-
-    /// A single-element run.
-    pub fn of(item: T) -> Self {
-        Self(Box::new([item]))
-    }
-
-    /// Structure-preserving map; non-emptiness is carried over.
-    pub fn map<U>(&self, f: impl FnMut(&T) -> U) -> NonEmpty<U> {
-        NonEmpty(self.0.iter().map(f).collect())
-    }
-}
-
-impl<T> std::ops::Deref for NonEmpty<T> {
-    type Target = [T];
-    fn deref(&self) -> &[T] {
-        &self.0
-    }
-}
-
-/// A coefficient column's loading: the intercept's implicit `1.0`, or a covariate as `T`.
+/// What one coefficient column of a term multiplies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Loading<T> {
-    /// The intercept column; loading value `1.0` at every observation.
-    Constant,
-    /// A slope column.
-    Covariate(T),
-}
-
-impl<T> Loading<T> {
-    /// The covariate payload; `None` for the constant column.
-    pub fn covariate(&self) -> Option<&T> {
-        match self {
-            Self::Constant => None,
-            Self::Covariate(t) => Some(t),
-        }
-    }
-
-    /// Replace the covariate payload, preserving which variant this is.
-    pub fn map<U>(&self, f: impl FnOnce(&T) -> U) -> Loading<U> {
-        match self {
-            Self::Constant => Loading::Constant,
-            Self::Covariate(t) => Loading::Covariate(f(t)),
-        }
-    }
+pub(crate) enum Column {
+    Intercept,
+    /// The term's slope `j`.
+    Slope(usize),
 }
 
 /// Mapping between caller-visible factor labels and compact numerical positions.
@@ -94,12 +42,6 @@ pub(crate) enum FactorEncoding {
     Identity { n_levels: usize },
     /// Arbitrary integer caller labels, ordered by internal position.
     Integer { labels: Arc<[u32]> },
-}
-
-struct EncodedFactor {
-    encoding: FactorEncoding,
-    positions: Option<Vec<u32>>,
-    sorted: bool,
 }
 
 impl FactorEncoding {
@@ -114,106 +56,25 @@ impl FactorEncoding {
         }
     }
 
-    fn encode_labels(labels: &[u32]) -> EncodedFactor {
-        let Some((&first, remaining)) = labels.split_first() else {
+    // Inlined into `build`, its label loops lose registers and reload pointers from the stack.
+    #[inline(never)]
+    fn encode_labels(labels: Cow<'_, [u32]>) -> EncodedFactor<'_> {
+        if labels.is_empty() {
             return EncodedFactor {
                 encoding: Self::identity(0),
-                positions: None,
+                levels: labels,
                 sorted: true,
             };
-        };
-
-        let mut min = first;
-        let mut max = first;
-        let mut previous = first;
-        let mut sorted = true;
-        for &label in remaining {
-            min = min.min(label);
-            max = max.max(label);
-            sorted &= label >= previous;
-            previous = label;
         }
-
-        let range_width = u64::from(max) - u64::from(min) + 1;
-        let presence_by_label = usize::try_from(range_width)
-            .ok()
-            .filter(|&width| width <= labels.len())
-            .map(|width| {
-                let mut present = vec![false; width];
-                for &label in labels {
-                    present[(label - min) as usize] = true;
-                }
-                present
-            });
-
-        match presence_by_label {
-            // Path 1: labels already form the zero-based identity range.
-            Some(present) if min == 0 && present.iter().all(|&is_present| is_present) => {
-                EncodedFactor {
-                    encoding: Self::identity(present.len()),
-                    positions: None,
-                    sorted,
-                }
+        match identify_label_layout(&labels) {
+            LabelLayout::Contiguous { min, max, sorted } => {
+                EncodedFactor::contiguous(labels, min, max, sorted)
             }
-            // Path 2: the observed label range is bounded by the observation count.
-            Some(present) => {
-                let range_width = present.len();
-                let caller_labels: Vec<u32> = present
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(offset, &present)| present.then_some(min + offset as u32))
-                    .collect();
-
-                let mut position_by_label = vec![0u32; range_width];
-                for (position, &label) in caller_labels.iter().enumerate() {
-                    position_by_label[(label - min) as usize] = position as u32;
-                }
-
-                let positions = labels
-                    .iter()
-                    .map(|&label| position_by_label[(label - min) as usize])
-                    .collect();
-                EncodedFactor {
-                    encoding: Self::integer(caller_labels),
-                    positions: Some(positions),
-                    sorted,
-                }
+            LabelLayout::SortedWithGaps => EncodedFactor::sorted_gaps(&labels),
+            LabelLayout::UnsortedDense { distinct_labels } => {
+                EncodedFactor::dense(&labels, distinct_labels)
             }
-            // Path 3: the observed label range is too wide for an indexed table.
-            None => {
-                // Collect distinct caller labels
-                let mut position_by_label = HashMap::<u32, u32>::new();
-                for &label in labels {
-                    position_by_label.entry(label).or_default();
-                }
-                // Internal positions follow ascending caller-label order
-                let mut caller_labels: Vec<u32> = position_by_label.keys().copied().collect();
-                caller_labels.sort_unstable();
-                // Populate the caller-label to internal-position map
-                for (position, &label) in caller_labels.iter().enumerate() {
-                    let position =
-                        u32::try_from(position).expect("an internal label position fits in u32");
-
-                    *position_by_label
-                        .get_mut(&label)
-                        .expect("label was collected from this map") = position;
-                }
-
-                let positions = labels
-                    .iter()
-                    .map(|label| {
-                        *position_by_label
-                            .get(label)
-                            .expect("every input label was inserted")
-                    })
-                    .collect();
-
-                EncodedFactor {
-                    encoding: Self::integer(caller_labels),
-                    positions: Some(positions),
-                    sorted,
-                }
-            }
+            LabelLayout::UnsortedSparse => EncodedFactor::sparse(&labels),
         }
     }
 
@@ -249,46 +110,258 @@ impl FactorEncoding {
     }
 }
 
-/// Per-term metadata; coefficient `c` of `level` lives at `offset + c · n_levels + level`.
-#[derive(Debug, Clone)]
-pub(crate) struct TermMeta {
-    pub(crate) encoding: FactorEncoding,
-    pub offset: usize,
-    /// Non-decreasing in the design's internal row order (fixed at construction).
-    pub sorted: bool,
-    /// Coefficient columns in layout order; `Covariate` indexes the frame's continuous columns.
-    pub columns: NonEmpty<Loading<u32>>,
+/// A factor's level encoding and level column (the input itself if already positions).
+struct EncodedFactor<'a> {
+    encoding: FactorEncoding,
+    levels: Cow<'a, [u32]>,
+    /// `levels` is non-decreasing.
+    sorted: bool,
 }
 
-impl TermMeta {
-    /// Frame columns of the term's covariates, in coefficient-column order.
-    pub(crate) fn covariates(&self) -> impl Iterator<Item = u32> + '_ {
-        self.columns.iter().filter_map(|c| c.covariate().copied())
+impl<'a> EncodedFactor<'a> {
+    /// Every value in `min..=max` occurs, so a label's internal position is `label - min`.
+    fn contiguous(labels: Cow<'a, [u32]>, min: u32, max: u32, sorted: bool) -> Self {
+        if min == 0 {
+            return Self {
+                encoding: FactorEncoding::identity(max as usize + 1),
+                levels: labels,
+                sorted,
+            };
+        }
+        Self {
+            encoding: FactorEncoding::integer((min..=max).into_par_iter().collect()),
+            levels: Cow::Owned(labels.par_iter().map(|&label| label - min).collect()),
+            sorted,
+        }
+    }
+}
+
+impl EncodedFactor<'static> {
+    /// Compact sorted labels with gaps by numbering runs, regardless of range width.
+    fn sorted_gaps(labels: &[u32]) -> Self {
+        let counts: Vec<usize> = labels
+            .par_chunks(LABEL_CHUNK)
+            .enumerate()
+            .map(|(chunk_idx, chunk)| {
+                let start = chunk_idx * LABEL_CHUNK;
+                // A run crossing a chunk boundary is counted only where it starts.
+                usize::from(start == 0 || chunk[0] != labels[start - 1])
+                    + chunk.windows(2).filter(|pair| pair[0] != pair[1]).count()
+            })
+            .collect();
+        let mut caller_labels = vec![0u32; counts.iter().sum()];
+        let mut positions = vec![0u32; labels.len()];
+        let mut remaining_labels = caller_labels.as_mut_slice();
+        let mut next_level = 0;
+        // Prefix the run counts and give each task disjoint output slices.
+        let chunks: Vec<_> = positions
+            .chunks_mut(LABEL_CHUNK)
+            .zip(counts)
+            .enumerate()
+            .map(|(chunk_idx, (positions, count))| {
+                let (distinct, rest) = std::mem::take(&mut remaining_labels).split_at_mut(count);
+                remaining_labels = rest;
+                let first_new_level = next_level;
+                next_level += count;
+                (chunk_idx, positions, distinct, first_new_level)
+            })
+            .collect();
+        chunks
+            .into_par_iter()
+            .for_each(|(chunk_idx, positions, distinct, mut next_level)| {
+                let start = chunk_idx * LABEL_CHUNK;
+                let chunk = &labels[start..start + positions.len()];
+                let mut previous = start.checked_sub(1).map(|i| labels[i]);
+                let mut distinct = distinct.iter_mut();
+                for (&label, position) in chunk.iter().zip(positions) {
+                    if previous != Some(label) {
+                        *distinct.next().expect("each run was counted") = label;
+                        next_level += 1;
+                        previous = Some(label);
+                    }
+                    // A continuing run retains the previous chunk's final ID.
+                    *position = (next_level - 1) as u32;
+                }
+            });
+
+        Self {
+            encoding: FactorEncoding::integer(caller_labels),
+            levels: Cow::Owned(positions),
+            sorted: true,
+        }
     }
 
-    pub(crate) fn has_slopes(&self) -> bool {
-        self.covariates().next().is_some()
+    /// Encode unsorted labels using their indices in `distinct_labels`,
+    /// which must hold the column's distinct labels in ascending order.
+    fn dense(labels: &[u32], distinct_labels: Vec<u32>) -> Self {
+        let min = distinct_labels[0];
+        let range_width = (distinct_labels[distinct_labels.len() - 1] - min) as usize + 1;
+        // Each slot is written by exactly one label, so relaxed atomics are plain stores.
+        let position_by_offset: Vec<AtomicU32> = (0..range_width)
+            .into_par_iter()
+            .map(|_| AtomicU32::new(0))
+            .collect();
+        distinct_labels
+            .par_iter()
+            .enumerate()
+            .for_each(|(position, &label)| {
+                position_by_offset[(label - min) as usize].store(position as u32, Relaxed);
+            });
+        let positions = labels
+            .par_iter()
+            .map(|&label| position_by_offset[(label - min) as usize].load(Relaxed))
+            .collect();
+
+        EncodedFactor {
+            encoding: FactorEncoding::integer(distinct_labels),
+            levels: Cow::Owned(positions),
+            sorted: false,
+        }
     }
 
-    pub(crate) fn has_intercept(&self) -> bool {
-        self.columns.iter().any(|c| c.covariate().is_none())
-    }
+    /// Encode unsorted labels: each rayon task numbers them in first-seen order,
+    /// one hash per label; only distinct labels are sorted, and their ranks
+    /// replace the task-local numbers through a small array per task.
+    fn sparse(labels: &[u32]) -> Self {
+        let mut positions = vec![0u32; labels.len()];
+        let pieces: Vec<(&mut [u32], Vec<u32>)> =
+            rayon::iter::split((labels, &mut positions[..]), |(labels, positions)| {
+                if labels.len() < 2 {
+                    return ((labels, positions), None);
+                }
+                let mid = labels.len() / 2;
+                let (left, right) = labels.split_at(mid);
+                let (left_positions, right_positions) = positions.split_at_mut(mid);
+                ((left, left_positions), Some((right, right_positions)))
+            })
+            .map(|(labels, positions)| {
+                let mut local_id = HashMap::<u32, u32, FxBuildHasher>::default();
+                let mut first_seen = Vec::new();
+                for (&label, position) in labels.iter().zip(positions.iter_mut()) {
+                    *position = *local_id.entry(label).or_insert_with(|| {
+                        first_seen.push(label);
+                        (first_seen.len() - 1) as u32
+                    });
+                }
+                (positions, first_seen)
+            })
+            .collect();
 
-    pub fn n_levels(&self) -> usize {
+        // Internal positions follow ascending caller-label order.
+        let mut caller_labels: Vec<u32> = pieces
+            .iter()
+            .flat_map(|(_, first_seen)| first_seen.iter().copied())
+            .collect::<HashSet<u32, FxBuildHasher>>()
+            .into_iter()
+            .collect();
+        caller_labels.par_sort_unstable();
+        let rank: HashMap<u32, u32, FxBuildHasher> = caller_labels
+            .iter()
+            .enumerate()
+            .map(|(position, &label)| {
+                let position =
+                    u32::try_from(position).expect("an internal label position fits in u32");
+                (label, position)
+            })
+            .collect();
+        pieces.into_par_iter().for_each(|(positions, first_seen)| {
+            let rank_by_local_id: Vec<u32> = first_seen.iter().map(|label| rank[label]).collect();
+            for position in positions {
+                *position = rank_by_local_id[*position as usize];
+            }
+        });
+
+        EncodedFactor {
+            encoding: FactorEncoding::integer(caller_labels),
+            levels: Cow::Owned(positions),
+            sorted: false,
+        }
+    }
+}
+
+/// One term's coefficients and rows: column `c` of `level` lives at `offset + c · n_levels + level`.
+#[derive(Debug, Clone)]
+pub(crate) struct Term<'a> {
+    pub(crate) encoding: FactorEncoding,
+    pub(crate) offset: usize,
+    /// Column 0 is an intercept; the slopes follow it.
+    pub(crate) intercept: bool,
+    /// Internal level position of every observation, in the design's row order.
+    levels: Cow<'a, [u32]>,
+    /// `levels` is non-decreasing.
+    sorted: bool,
+    /// Raw slopes in coefficient-column order, before whitening.
+    slopes: Vec<Cow<'a, [f64]>>,
+}
+
+impl Term<'_> {
+    pub(crate) fn n_levels(&self) -> usize {
         self.encoding.n_levels()
     }
 
-    pub fn n_columns(&self) -> usize {
-        self.columns.len()
+    pub(crate) fn has_slopes(&self) -> bool {
+        !self.slopes.is_empty()
     }
 
-    pub fn n_dofs(&self) -> usize {
+    pub(crate) fn n_columns(&self) -> usize {
+        self.intercept as usize + self.slopes.len()
+    }
+
+    pub(crate) fn n_dofs(&self) -> usize {
         self.n_columns() * self.n_levels()
     }
 
-    /// Global DOF base of coefficient column `column`.
-    pub fn column_base(&self, column: usize) -> usize {
-        self.offset + column * self.n_levels()
+    /// This term's coefficients in the global DOF vector.
+    pub(crate) fn dofs(&self) -> Range<usize> {
+        self.offset..self.offset + self.n_dofs()
+    }
+
+    /// Coefficient column `column`'s `n_levels` slots in the global DOF vector.
+    pub(crate) fn column_dofs(&self, column: usize) -> Range<usize> {
+        let start = self.offset + column * self.n_levels();
+        start..start + self.n_levels()
+    }
+
+    /// Coefficient column of slope `j`; the intercept, when present, comes first.
+    pub(crate) fn slope_column(&self, j: usize) -> usize {
+        self.intercept as usize + j
+    }
+
+    /// Column `index` in layout order: the inverse of [`slope_column`](Self::slope_column).
+    pub(crate) fn column(&self, index: usize) -> Column {
+        debug_assert!(index < self.n_columns());
+        match index.checked_sub(self.intercept as usize) {
+            None => Column::Intercept,
+            Some(j) => Column::Slope(j),
+        }
+    }
+
+    pub(crate) fn levels(&self) -> &[u32] {
+        &self.levels
+    }
+
+    pub(crate) fn sorted(&self) -> bool {
+        self.sorted
+    }
+
+    /// Raw slopes in coefficient-column order.
+    pub(crate) fn raw_slopes(&self) -> impl ExactSizeIterator<Item = &[f64]> {
+        self.slopes.iter().map(|slope| &**slope)
+    }
+
+    fn into_owned(self) -> Term<'static> {
+        Term {
+            encoding: self.encoding,
+            offset: self.offset,
+            intercept: self.intercept,
+            levels: Cow::Owned(self.levels.into_owned()),
+            sorted: self.sorted,
+            slopes: self
+                .slopes
+                .into_iter()
+                .map(|slope| Cow::Owned(slope.into_owned()))
+                .collect(),
+        }
     }
 }
 
@@ -297,11 +370,138 @@ pub(crate) fn row_weight(sqrt_weights: Option<&[f64]>, obs: usize) -> f64 {
     sqrt_weights.map_or(1.0, |s| s[obs] * s[obs])
 }
 
-/// Stable argsort of observations by a level column, ascending.
+const LABEL_CHUNK: usize = 65_536;
+
+/// Label layout used to select an encoding strategy.
+enum LabelLayout {
+    /// Every value in `min..=max` occurs; `sorted` indicates non-decreasing input.
+    Contiguous { min: u32, max: u32, sorted: bool },
+    /// Non-decreasing labels with missing values between their minimum and maximum.
+    SortedWithGaps,
+    /// Unsorted labels with gaps and a range no wider than the observation count.
+    /// `distinct_labels` contains the observed labels in non-decreasing order.
+    UnsortedDense { distinct_labels: Vec<u32> },
+    /// Unsorted labels whose range exceeds the observation count.
+    UnsortedSparse,
+}
+
+/// Identifies the label layout in terms of ordering, contiguity and range width.
 ///
-/// Compact internal positions guarantee `n_levels <= key.len()`, so counting sort
-/// takes `O(n_obs + n_levels)` time and `O(n_levels)` temporary memory.
-fn stable_argsort(key: &[u32], n_levels: usize) -> Vec<u32> {
+/// Requires nonempty `labels`.
+fn identify_label_layout(labels: &[u32]) -> LabelLayout {
+    match is_non_decreasing_with_gaps(labels) {
+        // Non-decreasing and contiguous.
+        Some(false) => LabelLayout::Contiguous {
+            min: labels[0],
+            max: labels[labels.len() - 1],
+            sorted: true,
+        },
+        // Non-decreasing with gaps.
+        Some(true) => LabelLayout::SortedWithGaps,
+        // Not non-decreasing: distinguish sparse gaps, dense gaps, and contiguous.
+        None => {
+            let (min, max) = labels.par_iter().map(|&label| (label, label)).reduce(
+                || (u32::MAX, u32::MIN),
+                |(lo, hi), (a, b)| (lo.min(a), hi.max(b)),
+            );
+            if (max - min) as usize >= labels.len() {
+                // Unsorted labels with sparse gaps
+                LabelLayout::UnsortedSparse
+            } else if let Some(distinct_labels) = get_distinct_labels(labels, min, max) {
+                // Unsorted labels with dense gaps
+                LabelLayout::UnsortedDense { distinct_labels }
+            } else {
+                // Unsorted contiguous labels
+                LabelLayout::Contiguous {
+                    min,
+                    max,
+                    sorted: false,
+                }
+            }
+        }
+    }
+}
+
+/// Checks if `labels` are in non-decreasing order and whether there are gaps.
+///
+/// Returns `None` if not non-decreasing, `Some(true)` if non-decreasing with gaps,
+/// and `Some(false)` if non-decreasing without gaps.
+/// Each chunk is scanned to the end with no early exit, so the comparisons vectorise;
+/// once a chunk descends, rayon skips the chunks not yet started.
+fn is_non_decreasing_with_gaps(labels: &[u32]) -> Option<bool> {
+    labels
+        .par_chunks(LABEL_CHUNK)
+        .enumerate()
+        .map(|(c_idx, chunk)| {
+            let start = c_idx * LABEL_CHUNK;
+            // Reach back one label so the pair across the chunk boundary is compared too.
+            let pairs = &labels[start.saturating_sub(1)..start + chunk.len()];
+            let (descends, skips) = pairs.windows(2).fold((false, false), |(d, s), pair| {
+                (
+                    d | (pair[1] < pair[0]),
+                    s | (pair[1].wrapping_sub(pair[0]) > 1),
+                )
+            });
+            (!descends).then_some(skips)
+        })
+        .try_reduce(|| false, |a, b| Some(a | b))
+}
+
+/// Finds the distinct values in `labels` and stops as soon as every value in `min..=max`
+/// has been seen. Returns `None` if all values in `min..=max` occur and otherwise the
+/// distinct values (`Some`).
+///
+/// Every label must lie in `min..=max`, and the range must be no wider than the column.
+fn get_distinct_labels(labels: &[u32], min: u32, max: u32) -> Option<Vec<u32>> {
+    let width = (max - min) as usize + 1;
+    debug_assert!(
+        width <= labels.len(),
+        "a table over the range would outgrow the column"
+    );
+    let present: Vec<AtomicBool> = (0..width)
+        .into_par_iter()
+        .map(|_| AtomicBool::new(false))
+        .collect();
+    // Every slot below the watermark is known to be filled.
+    let watermark = AtomicUsize::new(0);
+    // Moves the watermark past the slots seen filled and returns where it stops.
+    let advance = || {
+        let start = watermark.load(Relaxed);
+        let end = present[start..]
+            .iter()
+            .position(|slot| !slot.load(Relaxed))
+            .map_or(width, |offset| start + offset);
+        watermark.fetch_max(end, Relaxed);
+        end
+    };
+    let filled_early = labels.par_chunks(LABEL_CHUNK).any(|chunk| {
+        let mut filled_any = false;
+        for &label in chunk {
+            let slot = &present[(label - min) as usize];
+            // Loading first keeps repeated labels from bouncing a cache line between threads.
+            if !slot.load(Relaxed) {
+                slot.store(true, Relaxed);
+                filled_any = true;
+            }
+        }
+        // Only a chunk that filled a slot can have completed the table.
+        filled_any && advance() == width
+    });
+    // After the join every store is visible, so this last scan sees the final table.
+    if filled_early || advance() == width {
+        return None;
+    }
+    Some(
+        present
+            .into_par_iter()
+            .enumerate()
+            .filter_map(|(offset, slot)| slot.into_inner().then_some(min + offset as u32))
+            .collect(),
+    )
+}
+
+/// Rows grouped by level, ascending within each: level `l` owns `perm[offsets[l]..offsets[l + 1]]`.
+fn stable_argsort(key: &[u32], n_levels: usize) -> (Vec<usize>, Vec<u32>) {
     let n_obs = key.len();
     debug_assert!(
         u32::try_from(n_obs).is_ok(),
@@ -311,32 +511,38 @@ fn stable_argsort(key: &[u32], n_levels: usize) -> Vec<u32> {
         n_levels <= n_obs,
         "compact level count cannot exceed observation count"
     );
-    let mut cursors = vec![0usize; n_levels + 1];
+    let mut offsets = vec![0usize; n_levels + 1];
     for &k in key {
         debug_assert!(
             (k as usize) < n_levels,
             "counting sort key must be a level id (< n_levels)"
         );
-        cursors[k as usize + 1] += 1;
+        offsets[k as usize + 1] += 1;
     }
-    for i in 1..cursors.len() {
-        cursors[i] += cursors[i - 1];
+    for i in 1..offsets.len() {
+        offsets[i] += offsets[i - 1];
     }
+    let mut cursors = offsets[..n_levels].to_vec();
     let mut perm = vec![0u32; n_obs];
     for (i, &k) in key.iter().enumerate() {
         let cursor = &mut cursors[k as usize];
         perm[*cursor] = i as u32;
         *cursor += 1;
     }
-    perm
+    (offsets, perm)
 }
 
-/// Fixed-effects design: observation columns plus coefficient-space layout; clones share rows.
+// Inlined into `Design::build`, its loop measured +3–8% on slope designs.
+#[inline(never)]
+fn gather<T: Copy>(col: &[T], perm: &[u32]) -> Vec<T> {
+    perm.iter().map(|&k| col[k as usize]).collect()
+}
+
+/// Fixed-effects design: its terms; clones share rows.
 #[derive(Clone, Debug)]
 pub struct Design<'a> {
-    /// Columns in internal row order (caller's, or an owned locality-sorted copy).
-    pub(crate) frame: Arc<ObservationFrame<'a>>,
-    pub(crate) terms: Vec<TermMeta>,
+    /// Rows in internal order (caller's, or an owned locality-sorted copy).
+    pub(crate) terms: Arc<Vec<Term<'a>>>,
     pub(crate) n_obs: usize,
     pub(crate) n_dofs: usize,
     /// `obs_perm[k]` = caller's original index of the observation at internal position `k`.
@@ -346,93 +552,77 @@ pub struct Design<'a> {
 impl<'a> Design<'a> {
     /// Lower effect terms into a design, laid out term-major (`offset[t] + c · L_t + level`).
     pub fn new(effects: impl IntoIterator<Item = Effect<'a>>) -> Result<Self, BuildError> {
-        let mut categorical: Vec<Cow<'a, [u32]>> = Vec::new();
-        let mut continuous: Vec<Cow<'a, [f64]>> = Vec::new();
-        let mut structure: Vec<NonEmpty<Loading<u32>>> = Vec::new();
-        for effect in effects {
-            structure.push(effect.columns().map(|column| {
-                column.map(|&z| {
-                    continuous.push(Cow::Borrowed(z));
-                    (continuous.len() - 1) as u32
-                })
-            }));
-            categorical.push(Cow::Borrowed(effect.levels()));
-        }
-        let frame = ObservationFrame::new(categorical, continuous)?;
-        Self::build(frame, structure, true)
+        Self::build(effects.into_iter().collect(), true)
     }
 
-    /// Intercept-only factors; compacts observed labels and locality-sorts an unsorted dominant factor.
-    pub fn from_frame(frame: ObservationFrame<'a>) -> Result<Self, BuildError> {
-        let structure = vec![NonEmpty::of(Loading::Constant); frame.n_factors()];
-        Self::build(frame, structure, true)
+    /// [`new`](Self::new) without the locality sort — profiling escape hatch.
+    #[doc(hidden)]
+    pub fn new_unsorted(effects: impl IntoIterator<Item = Effect<'a>>) -> Result<Self, BuildError> {
+        Self::build(effects.into_iter().collect(), false)
     }
 
     /// Build an intercept-only design from an observation-major categories matrix.
     pub fn from_categories(categories: ArrayView2<'a, u32>) -> Result<Self, BuildError> {
         // Gather strided (C-order) columns once so every downstream read is contiguous.
-        let categorical = (0..categories.ncols())
+        let effects = (0..categories.ncols())
             .map(|factor| {
                 let column = categories.index_axis_move(Axis(1), factor);
-                match column.to_slice() {
+                let levels = match column.to_slice() {
                     Some(values) => Cow::Borrowed(values),
                     None => Cow::Owned(column.to_vec()),
+                };
+                Effect {
+                    levels,
+                    intercept: true,
+                    slopes: Vec::new(),
                 }
             })
             .collect();
-        Self::from_frame(ObservationFrame::new(categorical, Vec::new())?)
+        Self::build(effects, true)
     }
 
-    /// [`from_frame`](Self::from_frame) without the locality sort — profiling escape hatch.
-    #[doc(hidden)]
-    pub fn from_frame_unsorted(frame: ObservationFrame<'a>) -> Result<Self, BuildError> {
-        let structure = vec![NonEmpty::of(Loading::Constant); frame.n_factors()];
-        Self::build(frame, structure, false)
-    }
-
-    /// `column_structure[term]` = that term's coefficient columns, aligned with the frame.
-    fn build(
-        mut frame: ObservationFrame<'a>,
-        column_structure: Vec<NonEmpty<Loading<u32>>>,
-        locality_sort: bool,
-    ) -> Result<Self, BuildError> {
-        if frame.n_obs() == 0 {
+    fn build(effects: Vec<Effect<'a>>, locality_sort: bool) -> Result<Self, BuildError> {
+        let n_obs = effects.first().map_or(0, |e| e.levels.len());
+        for (column, e) in effects.iter().enumerate() {
+            if e.levels.len() != n_obs {
+                return Err(BuildError::ObservationCountMismatch {
+                    column,
+                    expected: n_obs,
+                    got: e.levels.len(),
+                });
+            }
+        }
+        if n_obs == 0 {
             return Err(BuildError::EmptyObservations);
         }
-        debug_assert_eq!(column_structure.len(), frame.n_factors());
 
-        let n_obs = frame.n_obs();
-        let mut terms = Vec::with_capacity(frame.n_factors());
+        let mut terms = Vec::with_capacity(effects.len());
         let mut offset = 0;
-        for (q, columns) in column_structure.into_iter().enumerate() {
+        for Effect {
+            levels,
+            intercept,
+            slopes,
+        } in effects
+        {
+            debug_assert!(
+                slopes.iter().all(|s| s.len() == levels.len()) && (intercept || !slopes.is_empty()),
+                "effect bypassed Effect::new validation"
+            );
             let EncodedFactor {
                 encoding,
-                positions,
+                levels,
                 sorted,
-            } = FactorEncoding::encode_labels(frame.level_column(q));
-            if let Some(positions) = positions {
-                frame.replace_level_column(q, positions);
-            }
-            let meta = TermMeta {
+            } = FactorEncoding::encode_labels(levels);
+            let term = Term {
                 encoding,
                 offset,
+                intercept,
+                levels,
                 sorted,
-                columns,
+                slopes,
             };
-            offset += meta.n_dofs();
-            terms.push(meta);
-        }
-
-        let claimed: usize = terms
-            .iter()
-            .flat_map(|t| t.columns.iter())
-            .filter(|c| c.covariate().is_some())
-            .count();
-        if claimed != frame.n_loading_columns() {
-            return Err(BuildError::UnclaimedLoadingColumns {
-                claimed,
-                provided: frame.n_loading_columns(),
-            });
+            offset += term.n_dofs();
+            terms.push(term);
         }
 
         // Rejected here rather than left to panic in `to_u32`.
@@ -441,34 +631,38 @@ impl<'a> Design<'a> {
         }
 
         // Sort by the term contributing the most DOFs so its gather/scatter runs sequentially.
-        let dominant = (0..terms.len()).max_by_key(|&q| terms[q].n_dofs());
-        let (frame, obs_perm) = match dominant {
-            Some(d) if locality_sort && !terms[d].sorted && u32::try_from(n_obs).is_ok() => {
-                let perm = stable_argsort(frame.level_column(d), terms[d].n_levels());
-                let sorted_frame = frame.permuted(&perm);
-                // Factors nested in the dominant one come out sorted, keeping coalesced scatter.
-                for (q, meta) in terms.iter_mut().enumerate() {
-                    meta.sorted = sorted_frame.level_column(q).is_sorted();
+        let dominant = terms.iter().max_by_key(|t| t.n_dofs());
+        let obs_perm = match dominant {
+            Some(d) if locality_sort && !d.sorted && u32::try_from(n_obs).is_ok() => {
+                let (_, perm) = stable_argsort(&d.levels, d.n_levels());
+                // Factors nested in the dominant one come out sorted and need no row index.
+                for t in terms.iter_mut() {
+                    let levels = gather(&t.levels, &perm);
+                    t.sorted = levels.is_sorted();
+                    t.levels = Cow::Owned(levels);
                 }
-                (sorted_frame, Some(perm.into()))
+                // Level columns before any slope: interleaving them measured +2–4% here.
+                for slope in terms.iter_mut().flat_map(|t| &mut t.slopes) {
+                    *slope = Cow::Owned(gather(slope, &perm));
+                }
+                Some(perm.into())
             }
-            _ => (frame, None),
+            _ => None,
         };
 
         Ok(Design {
-            frame: Arc::new(frame),
-            terms,
+            terms: Arc::new(terms),
             n_obs,
             n_dofs: offset,
             obs_perm,
         })
     }
 
-    /// Convert the frame's columns to owned, dropping ties to caller buffers.
+    /// Convert every column to owned, dropping ties to caller buffers.
     pub fn into_owned(self) -> Design<'static> {
+        let terms = Arc::unwrap_or_clone(self.terms);
         Design {
-            frame: Arc::new(Arc::unwrap_or_clone(self.frame).into_owned()),
-            terms: self.terms,
+            terms: Arc::new(terms.into_iter().map(Term::into_owned).collect()),
             n_obs: self.n_obs,
             n_dofs: self.n_dofs,
             obs_perm: self.obs_perm,
@@ -480,7 +674,7 @@ impl<'a> Design<'a> {
         debug_assert_eq!(v.len(), self.n_obs);
         match &self.obs_perm {
             None => Cow::Borrowed(v),
-            Some(perm) => Cow::Owned(perm.iter().map(|&i| v[i as usize]).collect()),
+            Some(perm) => Cow::Owned(gather(v, perm)),
         }
     }
 
@@ -510,9 +704,9 @@ impl<'a> Design<'a> {
         (0..self.terms[term].n_columns()).map(move |column| Channel { term, column })
     }
 
-    /// How `channel` loads onto each observation.
-    pub(crate) fn loading(&self, channel: Channel) -> Loading<u32> {
-        self.terms[channel.term].columns[channel.column]
+    /// What `channel` multiplies.
+    pub(crate) fn column(&self, channel: Channel) -> Column {
+        self.terms[channel.term].column(channel.column)
     }
 
     /// Number of observations (rows of D).
@@ -531,19 +725,13 @@ impl<'a> Design<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::observation::ObservationFrame;
-
-    fn frame(categorical: Vec<Vec<u32>>, continuous: Vec<Vec<f64>>) -> ObservationFrame<'static> {
-        ObservationFrame::new(
-            categorical.into_iter().map(Into::into).collect(),
-            continuous.into_iter().map(Into::into).collect(),
-        )
-        .unwrap()
-    }
 
     impl Design<'static> {
         pub(crate) fn from_levels_for_test(columns: Vec<Vec<u32>>) -> Self {
-            Design::from_frame(frame(columns, Vec::new())).expect("valid design")
+            let effects = columns
+                .iter()
+                .map(|c| Effect::new(c, true, []).expect("intercept effect"));
+            Design::new(effects).expect("valid design").into_owned()
         }
     }
 
@@ -576,7 +764,7 @@ mod tests {
             let mut expected: Vec<u32> = (0..n_obs as u32).collect();
             expected.sort_by_key(|&i| key[i as usize]);
             assert_eq!(
-                stable_argsort(&key, n_levels),
+                stable_argsort(&key, n_levels).1,
                 expected,
                 "n_obs={n_obs} n_levels={n_levels}"
             );
@@ -585,10 +773,10 @@ mod tests {
 
     #[test]
     fn build_compacts_large_integer_label() {
-        let design = Design::from_frame(frame(vec![vec![u32::MAX]], vec![])).unwrap();
+        let design = Design::from_levels_for_test(vec![vec![u32::MAX]]);
 
         assert_eq!(design.n_dofs, 1);
-        assert_eq!(design.frame.level_column(0), &[0]);
+        assert_eq!(design.terms[0].levels(), &[0]);
         assert_eq!(design.terms[0].encoding.label(0), Some(u32::MAX));
     }
 
@@ -612,12 +800,12 @@ mod tests {
     fn encode_labels_preserves_identity_encoding() {
         let EncodedFactor {
             encoding,
-            positions,
+            levels,
             sorted,
-        } = FactorEncoding::encode_labels(&[2, 0, 1, 2]);
+        } = FactorEncoding::encode_labels(Cow::Borrowed(&[2, 0, 1, 2]));
 
         assert_eq!(encoding, FactorEncoding::identity(3));
-        assert!(positions.is_none());
+        assert!(matches!(levels, Cow::Borrowed([2, 0, 1, 2])));
         assert!(!sorted);
     }
 
@@ -626,12 +814,12 @@ mod tests {
         // Range width = 3 and n_obs = 3, so this exercises the presence-table path.
         let EncodedFactor {
             encoding,
-            positions,
+            levels,
             sorted,
-        } = FactorEncoding::encode_labels(&[2, 0, 2]);
+        } = FactorEncoding::encode_labels(Cow::Borrowed(&[2, 0, 2]));
 
         assert_eq!(encoding, FactorEncoding::integer(vec![0, 2]));
-        assert_eq!(positions.as_deref(), Some(&[1u32, 0, 1][..]));
+        assert_eq!(*levels, [1, 0, 1]);
         assert!(!sorted);
     }
 
@@ -639,15 +827,15 @@ mod tests {
     fn encode_labels_compacts_shifted_bounded_range() {
         let EncodedFactor {
             encoding,
-            positions,
+            levels,
             sorted,
-        } = FactorEncoding::encode_labels(&[1_000_000, 1_000_001, 1_000_002]);
+        } = FactorEncoding::encode_labels(Cow::Borrowed(&[1_000_000, 1_000_001, 1_000_002]));
 
         assert_eq!(
             encoding,
             FactorEncoding::integer(vec![1_000_000, 1_000_001, 1_000_002])
         );
-        assert_eq!(positions.as_deref(), Some(&[0u32, 1, 2][..]));
+        assert_eq!(*levels, [0, 1, 2]);
         assert!(sorted);
     }
 
@@ -655,29 +843,28 @@ mod tests {
     fn encode_labels_compacts_large_span_without_span_allocation() {
         let EncodedFactor {
             encoding,
-            positions,
+            levels,
             sorted,
-        } = FactorEncoding::encode_labels(&[u32::MAX, 7, u32::MAX]);
+        } = FactorEncoding::encode_labels(Cow::Borrowed(&[u32::MAX, 7, u32::MAX]));
 
         assert_eq!(encoding, FactorEncoding::integer(vec![7, u32::MAX]));
-        assert_eq!(positions.as_deref(), Some(&[1u32, 0, 1][..]));
+        assert_eq!(*levels, [1, 0, 1]);
         assert!(!sorted);
     }
 
     #[test]
-    fn from_frame_sorts_owned_unsorted_dominant() {
+    fn new_sorts_unsorted_dominant() {
         // Factor 0 (3 levels) dominates and is unsorted; factor 1 starts sorted.
-        let design =
-            Design::from_frame(frame(vec![vec![2, 0, 1, 0], vec![0, 0, 1, 1]], vec![])).unwrap();
+        let design = Design::from_levels_for_test(vec![vec![2, 0, 1, 0], vec![0, 0, 1, 1]]);
 
         // Stable argsort of [2,0,1,0] → original indices [1,3,2,0].
         assert_eq!(design.obs_perm.as_deref(), Some(&[1u32, 3, 2, 0][..]));
-        assert!(design.terms[0].sorted);
+        assert!(design.terms[0].sorted());
         // Factor 1's permuted column [0,1,1,0] is no longer non-decreasing.
-        assert!(!design.terms[1].sorted);
+        assert!(!design.terms[1].sorted());
 
-        assert_eq!(design.frame.level_column(0), [0, 0, 1, 2]);
-        assert_eq!(design.frame.level_column(1), [0, 1, 1, 0]);
+        assert_eq!(design.terms[0].levels(), [0, 0, 1, 2]);
+        assert_eq!(design.terms[1].levels(), [0, 1, 1, 0]);
     }
 
     #[test]
@@ -685,36 +872,33 @@ mod tests {
         // Factor 1 is nested in dominant factor 0, so the rescan must detect it stays sorted.
         let col0 = vec![3u32, 0, 2, 1];
         let col1: Vec<u32> = col0.iter().map(|&v| v / 2).collect();
-        let design = Design::from_frame(frame(vec![col0, col1], vec![])).unwrap();
+        let design = Design::from_levels_for_test(vec![col0, col1]);
         assert!(design.obs_perm.is_some());
-        assert!(design.terms[0].sorted);
-        assert!(design.terms[1].sorted);
+        assert!(design.terms[0].sorted());
+        assert!(design.terms[1].sorted());
     }
 
     #[test]
-    fn from_frame_keeps_sorted_input() {
-        let design =
-            Design::from_frame(frame(vec![vec![0, 0, 1, 2], vec![1, 0, 1, 0]], vec![])).unwrap();
+    fn new_keeps_sorted_input() {
+        let design = Design::from_levels_for_test(vec![vec![0, 0, 1, 2], vec![1, 0, 1, 0]]);
         assert!(design.obs_perm.is_none());
-        assert!(design.terms[0].sorted);
-        assert!(!design.terms[1].sorted);
+        assert!(design.terms[0].sorted());
+        assert!(!design.terms[1].sorted());
     }
 
     #[test]
-    fn from_frame_rejects_unclaimed_loading_columns() {
-        let err = Design::from_frame(frame(vec![vec![0, 1]], vec![vec![1.0, 2.0]])).unwrap_err();
-        assert!(matches!(
-            err,
-            BuildError::UnclaimedLoadingColumns {
-                claimed: 0,
-                provided: 1
-            }
-        ));
+    fn clone_shares_sorted_row_storage() {
+        // The locality sort owns both levels and slopes; a solver's clone must not copy them.
+        let (f, z) = ([2u32, 0, 1, 0], [1.0, 2.0, 3.0, 4.0]);
+        let design = Design::new(vec![Effect::new(&f, true, [&z[..]]).unwrap()]).unwrap();
+        assert!(design.obs_perm.is_some());
+        let clone = design.clone();
+        assert!(Arc::ptr_eq(&clone.terms, &design.terms));
     }
 
     #[test]
     fn new_lays_out_slope_terms_term_major() {
-        // Sorted levels keep the locality sort a no-op, so frame columns stay in caller order.
+        // Sorted levels keep the locality sort a no-op, so columns stay in caller order.
         let f0 = [0u32, 0, 1, 1];
         let f1 = [0u32, 2, 1, 0];
         let z0 = [1.0, 2.0, 3.0, 4.0];
@@ -727,26 +911,35 @@ mod tests {
         let design = Design::new(effects).unwrap();
 
         // term 0: [intercept, z0, z1] over 2 levels; term 1: intercept over 3; term 2: slope.
-        assert_eq!(design.terms[0].offset, 0);
-        assert_eq!(design.terms[0].n_dofs(), 6);
-        assert_eq!(design.terms[1].offset, 6);
-        assert_eq!(design.terms[1].n_dofs(), 3);
-        assert_eq!(design.terms[2].offset, 9);
-        assert!(!matches!(design.terms[2].columns[0], Loading::Constant));
-        assert_eq!(design.terms[2].n_dofs(), 2);
+        let layout = |t: &Term| (t.offset, t.intercept, t.n_columns(), t.n_dofs());
+        assert_eq!(layout(&design.terms[0]), (0, true, 3, 6));
+        assert_eq!(layout(&design.terms[1]), (6, true, 1, 3));
+        assert_eq!(layout(&design.terms[2]), (9, false, 1, 2));
         assert_eq!(design.n_dofs, 11);
 
-        // slope indices resolve to the effects' loading columns in the frame.
-        assert_eq!(
-            &*design.terms[0].columns,
-            &[
-                Loading::Constant,
-                Loading::Covariate(0),
-                Loading::Covariate(1)
-            ]
-        );
-        assert_eq!(&*design.terms[2].columns, &[Loading::Covariate(2)]);
-        assert_eq!(design.frame.loading_column(0), &z0[..]);
-        assert_eq!(design.frame.loading_column(2), &z1[..]);
+        // Each term's slopes are the effect's own, in effect order.
+        let slopes = |term: usize| design.terms[term].raw_slopes().collect::<Vec<_>>();
+        assert_eq!(slopes(0), [&z0[..], &z1[..]]);
+        assert!(slopes(1).is_empty());
+        assert_eq!(slopes(2), [&z1[..]]);
+    }
+
+    #[test]
+    fn locality_sort_keeps_levels_and_slopes_row_aligned() {
+        // Dominant factor [2,0,1,0] argsorts to caller positions [1,3,2,0].
+        let (f0, f1) = ([2u32, 0, 1, 0], [0u32, 1, 1, 0]);
+        let (z0, z1) = ([10.0, 20.0, 30.0, 40.0], [1.0, 2.0, 3.0, 4.0]);
+        let design = Design::new(vec![
+            Effect::new(&f0, true, [&z0[..]]).unwrap(),
+            Effect::new(&f1, false, [&z1[..]]).unwrap(),
+        ])
+        .unwrap();
+
+        assert_eq!(design.obs_perm.as_deref(), Some(&[1, 3, 2, 0][..]));
+        assert_eq!(design.terms[0].levels(), &[0, 0, 1, 2]);
+        assert_eq!(design.terms[1].levels(), &[1, 0, 1, 0]);
+        let slope = |term: usize| design.terms[term].raw_slopes().next().unwrap();
+        assert_eq!(slope(0), &[20.0, 40.0, 30.0, 10.0]);
+        assert_eq!(slope(1), &[2.0, 4.0, 3.0, 1.0]);
     }
 }

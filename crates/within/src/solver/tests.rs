@@ -4,10 +4,9 @@ use rstest::rstest;
 
 use super::{CoefficientAddress, CoefficientLayout};
 use crate::channel::Channel;
-use crate::config::{LocalSolverConfig, LsmrOptions, DEFAULT_DENSE_SCHUR_THRESHOLD};
-use crate::domain::{build_local_domains, Design, Grounding, MatrixForm, PreparedDesign};
-use crate::AliasVerdict::{self, Constrained, Kept};
-use crate::{BuildWarning, Effect, PreconditionerConfig, Solver};
+use crate::config::{LocalSolverConfig, LsmrOptions};
+use crate::domain::Design;
+use crate::{Effect, PreconditionerConfig, Solver};
 
 /// DGP kept in lockstep with `surplus_component_sampled_matches_exact_reduction`
 /// in `tests/slopes_routing.rs`. A positive slope-only term is not centered by
@@ -31,23 +30,19 @@ fn positive_slope_only_panel() -> (Vec<u32>, Vec<u32>, Vec<f64>) {
 }
 
 #[test]
-fn positive_slope_only_pair_grounds_beyond_dense_threshold() {
-    let (f, g, z) = positive_slope_only_panel();
+fn an_alias_its_scaling_misses_keeps_its_surplus() {
+    // The null vector spans 1e200, beyond the relaxation; floating would drop a third of the diagonal.
+    let (slope_level, intercept_level, z) = ([0u32, 0], [0u32, 1], [1e-200, 1.0]);
     let effects = vec![
-        Effect::new(&f, false, [&z[..]]).expect("slope effect"),
-        Effect::new(&g, true, []).expect("plain effect"),
+        Effect::new(&slope_level, false, [&z[..]]).unwrap(),
+        Effect::new(&intercept_level, true, []).unwrap(),
     ];
-    let prepared = PreparedDesign::unweighted_for_test(Design::new(effects).expect("design"));
-    let (domains, warnings) =
-        build_local_domains(&prepared, &LocalSolverConfig::default()).expect("domains");
+    let solver = Solver::new(effects, None, additive()).expect("solver");
+    let out = solve_tight(&solver, &[0.3, 0.7]);
+    let worst = out.demeaned.iter().fold(0.0f64, |m, r| m.max(r.abs()));
     assert!(
-        domains.iter().any(|ld| {
-            let ct = &ld.component.matrix.cross_tab;
-            ld.component.form == MatrixForm::Laplacian
-                && ld.component.matrix.grounding == Grounding::Grounded
-                && ct.n_rows().min(ct.n_cols()) > DEFAULT_DENSE_SCHUR_THRESHOLD
-        }),
-        "fixture must ground a component past the dense threshold (warnings: {warnings:?})"
+        worst < 1e-12,
+        "the design fits exactly: residual {worst:.3e}"
     );
 }
 
@@ -109,10 +104,10 @@ fn solvers_built_from_a_borrowed_design_share_its_storage() {
     let weighted = Solver::new(&design, Some(&w), &PreconditionerConfig::Diagonal).unwrap();
 
     assert!(Arc::ptr_eq(
-        &unweighted.prepared.design.frame,
-        &design.frame
+        &unweighted.prepared.design.terms,
+        &design.terms
     ));
-    assert!(Arc::ptr_eq(&weighted.prepared.design.frame, &design.frame));
+    assert!(Arc::ptr_eq(&weighted.prepared.design.terms, &design.terms));
     let a = unweighted.solve(&y, None).unwrap();
     let b = weighted.solve(&y, None).unwrap();
     assert!(a.converged && b.converged);
@@ -129,13 +124,14 @@ enum SlopeSpec {
     /// The year index perturbed off the year term's span by the given amount.
     NearYearIndex(f64),
     SharedWithFirm,
-    /// Two worker slopes that both alias the year term, and each other to `1e-6`; whitening
-    /// spends the first on the second, so only the second still proposes a direction.
+    /// Two worker slopes that both alias the year term, and each other to `1e-6`.
     DuplicateYearIndex,
     YearIndexWithoutIntercept,
     /// Two independent aliases at once: the worker's slope is the year index and a fourth
     /// term's slope is the firm index, each reproduced by a different term.
     TwoIndependentAliases,
+    /// Year plus a per-worker cohort: in the span of worker and year together, of neither alone.
+    AgeCohort,
 }
 
 struct AkmPanel {
@@ -176,6 +172,17 @@ impl AkmPanel {
     }
 }
 
+/// A fixed-seed xorshift stream of draws in `[0, 1)`.
+fn uniform_draws() -> impl FnMut() -> f64 {
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
 fn akm_panel(
     n_workers: usize,
     n_firms: usize,
@@ -183,13 +190,7 @@ fn akm_panel(
     mobility: f64,
     spec: SlopeSpec,
 ) -> AkmPanel {
-    let mut state = 0x2545_f491_4f6c_dd1du64;
-    let mut next = move || {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        (state >> 11) as f64 / (1u64 << 53) as f64
-    };
+    let mut next = uniform_draws();
     let mut panel = AkmPanel {
         worker: Vec::new(),
         firm: Vec::new(),
@@ -216,6 +217,7 @@ fn akm_panel(
                 | SlopeSpec::YearIndexWithoutIntercept
                 | SlopeSpec::TwoIndependentAliases => t as f64,
                 SlopeSpec::NearYearIndex(delta) => t as f64 + delta * next(),
+                SlopeSpec::AgeCohort => (t + 20 + w * 7919 % 40) as f64,
             };
             if matches!(spec, SlopeSpec::DuplicateYearIndex) {
                 panel.z2.push(z + 1e-6 * z * z);
@@ -240,12 +242,14 @@ fn akm_panel(
 /// normal equations force one: only an intercept makes the within-level sum a residual leg.
 fn max_abs_group_mean(design: &Design<'_>, demeaned: &[f64]) -> f64 {
     let demeaned = design.permute_obs_in(demeaned);
-    (0..design.terms.len())
-        .filter(|&term| design.terms[term].has_intercept())
-        .map(|term| {
-            let levels = design.frame.level_column(term);
-            let mut sums = vec![0.0f64; design.terms[term].n_levels()];
-            let mut counts = vec![0.0f64; design.terms[term].n_levels()];
+    design
+        .terms
+        .iter()
+        .filter(|t| t.intercept)
+        .map(|t| {
+            let levels = t.levels();
+            let mut sums = vec![0.0f64; t.n_levels()];
+            let mut counts = vec![0.0f64; t.n_levels()];
             for (obs, &level) in levels.iter().enumerate() {
                 sums[level as usize] += demeaned[obs];
                 counts[level as usize] += 1.0;
@@ -259,32 +263,10 @@ fn max_abs_group_mean(design: &Design<'_>, demeaned: &[f64]) -> f64 {
         .fold(0.0f64, f64::max)
 }
 
-fn constrained_rank(solver: &Solver<'_>) -> Option<usize> {
-    solver
-        .preconditioner()
-        .and_then(|p| p.gauge.as_ref())
-        .map(|gauge| gauge.rank())
-}
-
-fn verdicts(solver: &Solver<'_>) -> Vec<AliasVerdict> {
-    solver
-        .warnings()
-        .iter()
-        .filter_map(|w| match w {
-            BuildWarning::CollinearSlopeCovariate { verdict, .. } => Some(*verdict),
-            _ => None,
-        })
-        .collect()
-}
-
-/// The spectral floor off, so only the gauge constraint can save an aliased solve.
-fn unfloored() -> PreconditionerConfig {
+/// Schwarz built up front, so an aliased solve rests on the local solves.
+fn additive() -> PreconditionerConfig {
     PreconditionerConfig::Additive {
-        local_solver: LocalSolverConfig {
-            ridge: 0.0,
-            ..Default::default()
-        },
-        reduction: Default::default(),
+        local_solver: Default::default(),
     }
 }
 
@@ -302,67 +284,22 @@ fn solve_tight(solver: &Solver<'_>, y: &[f64]) -> crate::SolveResult {
 }
 
 #[rstest]
-#[case::unrelated(SlopeSpec::Independent, &[], None)]
-#[case::exact_alias(SlopeSpec::YearIndex, &[Constrained], Some(1))]
-#[case::shared_covariate(SlopeSpec::SharedWithFirm, &[Constrained, Constrained], Some(1))]
-#[case::deep_null(SlopeSpec::NearYearIndex(1e-10), &[Constrained], Some(1))]
-#[case::recoverable_at_the_floor(SlopeSpec::NearYearIndex(1e-8), &[Kept], None)]
-#[case::recoverable(SlopeSpec::NearYearIndex(1e-6), &[Kept], None)]
-#[case::near_alias(SlopeSpec::NearYearIndex(1e-3), &[Kept], None)]
-#[case::duplicate_aliases(SlopeSpec::DuplicateYearIndex, &[Kept, Constrained], Some(1))]
-#[case::alias_without_intercept(SlopeSpec::YearIndexWithoutIntercept, &[Constrained], Some(1))]
-#[case::two_independent_aliases(SlopeSpec::TwoIndependentAliases, &[Constrained, Constrained], Some(2))]
-fn a_warned_direction_is_removed_only_when_it_carries_nothing(
-    #[case] spec: SlopeSpec,
-    #[case] expected: &[AliasVerdict],
-    #[case] rank: Option<usize>,
-) {
+#[case::unrelated(SlopeSpec::Independent)]
+#[case::exact_alias(SlopeSpec::YearIndex)]
+#[case::shared_covariate(SlopeSpec::SharedWithFirm)]
+#[case::near_alias_1e10(SlopeSpec::NearYearIndex(1e-10))]
+#[case::near_alias_1e8(SlopeSpec::NearYearIndex(1e-8))]
+#[case::near_alias_1e6(SlopeSpec::NearYearIndex(1e-6))]
+#[case::near_alias_1e3(SlopeSpec::NearYearIndex(1e-3))]
+#[case::duplicate_aliases(SlopeSpec::DuplicateYearIndex)]
+#[case::alias_without_intercept(SlopeSpec::YearIndexWithoutIntercept)]
+#[case::two_independent_aliases(SlopeSpec::TwoIndependentAliases)]
+#[case::alias_of_two_terms(SlopeSpec::AgeCohort)]
+fn an_aliased_slope_converges(#[case] spec: SlopeSpec) {
     let panel = akm_panel(4_000, 200, 10, 0.15, spec);
-    let solver = Solver::new(panel.effects(), None, unfloored()).expect("solver");
+    let solver = Solver::new(panel.effects(), None, additive()).expect("solver");
     let out = solve_tight(&solver, &panel.y);
-    // Without the constraint an aliased solve reports a false convergence at an O(1) mean.
-    let group_mean = max_abs_group_mean(&solver.prepared.design, &out.demeaned);
-    assert!(
-        out.converged && group_mean < 1e-9,
-        "converged={}, gm={group_mean:.3e}",
-        out.converged
-    );
-    assert_eq!(verdicts(&solver), expected, "{:?}", solver.warnings());
-    // Two proposals can name one direction; the duplicate is spent against the first row.
-    assert_eq!(constrained_rank(&solver), rank);
-
-    // The gauge is the design's, not the factorization's: a deserialized preconditioner gets it
-    // back from the solver it is attached to.
-    let bytes = postcard::to_stdvec(solver.preconditioner().expect("built")).expect("serialize");
-    let prebuilt: crate::Preconditioner = postcard::from_bytes(&bytes).expect("deserialize");
-    assert!(prebuilt.gauge.is_none());
-    let reattached = Solver::new(panel.effects(), None, prebuilt).expect("solver");
-    assert_eq!(constrained_rank(&reattached), rank);
-}
-
-/// Escalates after any single non-vanishing contraction, so a handoff is deterministic.
-fn eager_ladder(local_solver: LocalSolverConfig) -> PreconditionerConfig {
-    PreconditionerConfig::Adaptive {
-        local_solver,
-        reduction: Default::default(),
-        stall: crate::Staleness::try_new(1, 0.0).expect("valid staleness"),
-    }
-}
-
-/// The escalated rung is built after the gauge, so it has to inherit it: an aliased design that
-/// hands off would otherwise run its second rung unconstrained.
-#[test]
-fn an_escalated_rung_keeps_the_constrained_directions_out() {
-    let panel = akm_panel(4_000, 200, 10, 0.15, SlopeSpec::YearIndex);
-    let ladder = eager_ladder(LocalSolverConfig {
-        ridge: 0.0,
-        ..Default::default()
-    });
-    let solver = Solver::new(panel.effects(), None, ladder).expect("solver");
-    let out = solve_tight(&solver, &panel.y);
-
-    assert!(solver.has_escalated(), "eager stall must hand off");
-    assert_eq!(constrained_rank(&solver), Some(1));
+    // A floating component grounded by mistake reports a false convergence at an O(1) mean.
     let group_mean = max_abs_group_mean(&solver.prepared.design, &out.demeaned);
     assert!(
         out.converged && group_mean < 1e-9,
@@ -371,8 +308,7 @@ fn an_escalated_rung_keeps_the_constrained_directions_out() {
     );
 }
 
-/// Two crossed slope terms on one covariate: large enough for the diagonal to stall, and
-/// screened as collinear at construction.
+/// Two crossed slope terms on one covariate: large enough for the diagonal to stall.
 struct SharedCovariatePair {
     a: Vec<u32>,
     b: Vec<u32>,
@@ -400,38 +336,6 @@ impl SharedCovariatePair {
     }
 }
 
-/// Design screening runs at construction, so its warnings must survive the deferred
-/// Schwarz build rather than being replaced by it (#260 over #283).
-#[test]
-fn screening_warnings_survive_escalation() {
-    let panel = SharedCovariatePair::new();
-    let collinear = |solver: &Solver<'_>| {
-        solver
-            .warnings()
-            .iter()
-            .filter(|w| matches!(w, BuildWarning::CollinearSlopeCovariate { .. }))
-            .count()
-    };
-
-    let solver =
-        Solver::new(panel.effects(), None, eager_ladder(Default::default())).expect("solver");
-    let before = collinear(&solver);
-    assert!(
-        before > 0,
-        "shared covariate must warn: {:?}",
-        solver.warnings()
-    );
-
-    let _ = solver.solve(&panel.y, None).expect("adaptive solve");
-    assert!(solver.has_escalated(), "eager stall must hand off");
-    assert_eq!(
-        collinear(&solver),
-        before,
-        "escalation dropped screening warnings: {:?}",
-        solver.warnings()
-    );
-}
-
 /// A deferred build that fails is settled like one that succeeds: the second solve reports the
 /// same error without the ladder rebuilding, and re-failing, the same map.
 #[test]
@@ -442,14 +346,18 @@ fn a_failed_deferred_build_is_kept_and_reported_again() {
 
     // A zero-tolerance, zero-iteration certificate rejects the signed cross-block deterministically.
     let panel = SharedCovariatePair::new();
-    let precond = eager_ladder(LocalSolverConfig {
-        scaling: ScalingConfig {
-            tolerance: 0.0,
-            max_iterations: 0,
-            on_failure: ScalingFailure::Error,
+    let precond = PreconditionerConfig::Adaptive {
+        local_solver: LocalSolverConfig {
+            scaling: ScalingConfig {
+                tolerance: 0.0,
+                max_iterations: 0,
+                on_failure: ScalingFailure::Error,
+            },
+            ..LocalSolverConfig::default()
         },
-        ..LocalSolverConfig::default()
-    });
+        // Escalates after any single non-vanishing contraction, so the handoff is deterministic.
+        stall: crate::Staleness::try_new(1, 0.0).expect("valid staleness"),
+    };
     let solver = Solver::new(panel.effects(), None, precond).unwrap();
     let unscalable = |r: &Result<crate::SolveResult, WithinError>| {
         matches!(
@@ -470,30 +378,6 @@ fn a_failed_deferred_build_is_kept_and_reported_again() {
     assert!(!solver.has_escalated());
 }
 
-/// A batch runs its right-hand sides on rayon workers that also execute the base apply's
-/// subdomain jobs; the constraint's scratch must never be held across that apply.
-#[test]
-fn a_constrained_batch_solve_does_not_deadlock() {
-    let panel = akm_panel(4_000, 200, 10, 0.15, SlopeSpec::YearIndex);
-    let solver = Solver::new(panel.effects(), None, unfloored()).expect("solver");
-    assert_eq!(constrained_rank(&solver), Some(1));
-    let ys: Vec<Vec<f64>> = (0..64)
-        .map(|k| panel.y.iter().map(|v| v * (k + 1) as f64).collect())
-        .collect();
-    let refs: Vec<&[f64]> = ys.iter().map(Vec::as_slice).collect();
-    let out = solver
-        .solve_batch(
-            &refs,
-            &LsmrOptions {
-                tol: 1e-12,
-                maxiter: 20_000,
-                ..Default::default()
-            },
-        )
-        .expect("batch");
-    assert!(out.converged.iter().all(|&c| c), "{:?}", out.converged);
-}
-
 /// Three mutually orthogonal, centered ±1 columns on eight observations.
 fn walsh_columns() -> ([f64; 8], [f64; 8], [f64; 8]) {
     (
@@ -504,18 +388,16 @@ fn walsh_columns() -> ([f64; 8], [f64; 8], [f64; 8]) {
 }
 
 /// Share of `y` left after residualizing on `effects` under the default preconditioner.
-fn residual_share<'a>(effects: Vec<Effect<'a>>, y: &[f64]) -> (Solver<'a>, f64) {
+fn residual_share(effects: Vec<Effect<'_>>, y: &[f64]) -> f64 {
     let solver = Solver::new(effects, None, None).expect("solver");
     let out = solve_tight(&solver, y);
     let energy = |v: &[f64]| v.iter().map(|x| x * x).sum::<f64>();
-    let share = energy(&out.demeaned) / energy(y);
-    (solver, share)
+    energy(&out.demeaned) / energy(y)
 }
 
-/// Whitening spent the carrying term's own `c` direction on a near-duplicate slope whose remainder
-/// the other term does not span, so the proposed difference of fits is not a null.
+/// A near-duplicate slope whose remainder the other term does not span still residualizes fully.
 #[test]
-fn a_covariate_its_own_term_no_longer_carries_is_not_a_null() {
+fn a_near_duplicate_slope_residualizes_its_span() {
     let (c, _, e) = walsh_columns();
     let near: [f64; 8] = std::array::from_fn(|i| 2.0 * c[i] + 1e-6 * e[i]);
     let level = [0u32; 8];
@@ -524,21 +406,13 @@ fn a_covariate_its_own_term_no_longer_carries_is_not_a_null() {
         Effect::new(&level, true, [&c[..]]).unwrap(),
     ];
     // `e` lies in the design's span, so nothing of it may survive residualization.
-    let (solver, share) = residual_share(effects, &e);
-    assert_eq!(
-        verdicts(&solver),
-        [Kept, Kept, Kept],
-        "{:?}",
-        solver.warnings()
-    );
-    assert_eq!(constrained_rank(&solver), None);
+    let share = residual_share(effects, &e);
     assert!(share < 1e-12, "share={share:.3e}");
 }
 
-/// Two certified proposals `c` and `c + 1e-3·d + 5e-11·e` name one null and a contrast whose
-/// unexplained `e` part is divided by the contrast's `1e-3` share: the contrast is not certified.
+/// A slope `c + 1e-3·d + 5e-11·e` beside a term carrying `c` and `d` still residualizes fully.
 #[test]
-fn a_contrast_of_certified_proposals_is_not_itself_certified() {
+fn a_near_combination_slope_residualizes_its_span() {
     let (c, d, e) = walsh_columns();
     let near: [f64; 8] = std::array::from_fn(|i| c[i] + 1e-3 * d[i] + 5e-11 * e[i]);
     let level = [0u32; 8];
@@ -546,12 +420,48 @@ fn a_contrast_of_certified_proposals_is_not_itself_certified() {
         Effect::new(&level, true, [&c[..], &near[..]]).unwrap(),
         Effect::new(&level, true, [&c[..], &d[..]]).unwrap(),
     ];
-    let (solver, share) = residual_share(effects, &e);
-    assert_eq!(
-        constrained_rank(&solver),
-        Some(1),
-        "{:?}",
-        solver.warnings()
-    );
+    let share = residual_share(effects, &e);
     assert!(share < 1e-12, "share={share:.3e}");
+}
+
+/// A mean-year noise loading must not tie a near-isolated year into the alias block.
+#[test]
+fn an_alias_through_a_zero_loading_still_converges() {
+    let mut next = uniform_draws();
+    let (n_workers, n_firms, n_years) = (500, 25, 11);
+    let (mut worker, mut firm, mut year, mut z, mut y) = (vec![], vec![], vec![], vec![], vec![]);
+    for w in 0..n_workers {
+        let mut years: Vec<usize> = (0..n_years).collect();
+        for k in (1..n_years).rev() {
+            years.swap(k, (next() * (k + 1) as f64) as usize % (k + 1));
+        }
+        let mut current = (next() * n_firms as f64) as usize % n_firms;
+        for t in years {
+            if next() < 0.15 {
+                current = (next() * n_firms as f64) as usize % n_firms;
+            }
+            worker.push(w as u32);
+            firm.push(current as u32);
+            year.push(t as u32);
+            z.push(1e6 + t as f64);
+            y.push(current as f64 + 0.3 * t as f64 + next() - 0.5);
+        }
+    }
+    let effects = vec![
+        Effect::new(&worker, true, [&z[..]]).unwrap(),
+        Effect::new(&firm, true, []).unwrap(),
+        Effect::new(&year, true, []).unwrap(),
+    ];
+    let schwarz = PreconditionerConfig::Additive {
+        local_solver: Default::default(),
+    };
+    let solver = Solver::new(effects, None, schwarz).expect("solver");
+    let out = solve_tight(&solver, &y);
+    let group_mean = max_abs_group_mean(&solver.prepared.design, &out.demeaned);
+    assert!(
+        out.converged && group_mean < 1e-9,
+        "converged={}, iterations={}, gm={group_mean:.3e}",
+        out.converged,
+        out.iterations
+    );
 }

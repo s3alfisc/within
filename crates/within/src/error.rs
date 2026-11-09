@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-use crate::channel::{Channel, ChannelPair};
+use crate::channel::ChannelPair;
 
 pub use schwarz_precond::SolveError;
 
@@ -13,14 +13,14 @@ pub enum BuildError {
     /// No observations provided.
     #[error("no observations provided")]
     EmptyObservations,
-    /// One column does not match the expected observation count.
+    /// One effect does not match the first effect's observation count.
     #[error("column {column} has {got} observations, expected {expected}")]
     ObservationCountMismatch {
-        /// Index of the mismatched column (categorical first, then continuous).
+        /// Index of the mismatched effect.
         column: usize,
         /// Expected number of observations.
         expected: usize,
-        /// Actual number of observations in this column.
+        /// Actual number of observations in this effect.
         got: usize,
     },
     /// An effect with neither an intercept nor a slope.
@@ -96,25 +96,11 @@ pub enum BuildError {
         /// Actual column count of the supplied preconditioner.
         actual_cols: usize,
     },
-    /// A negative floor breaks the dominance invariant; a non-finite one poisons every solve.
-    #[error("local solver ridge must be finite and non-negative, got {value}")]
-    InvalidRidge {
-        /// The offending value.
-        value: f64,
-    },
-    /// Every dominance comparison is `>`, so a NaN or infinite slack silently certifies anything.
-    #[error("scaling tolerance must be finite and non-negative, got {value}")]
+    /// A scaling tolerance outside `[0, 1)`.
+    #[error("scaling tolerance must lie in [0, 1), got {value}")]
     InvalidScalingTolerance {
         /// The offending value.
         value: f64,
-    },
-    /// The frame carries continuous columns that no term uses as a slope.
-    #[error("frame has {provided} loading columns but the terms claim {claimed}")]
-    UnclaimedLoadingColumns {
-        /// Loading columns referenced by the terms.
-        claimed: usize,
-        /// Continuous columns in the frame.
-        provided: usize,
     },
     /// The compact coefficient space exceeds the internal `u32` index width.
     #[error("design has {n_dofs} degrees of freedom, exceeding the u32 column-index limit")]
@@ -137,27 +123,6 @@ pub enum BuildWarning {
         /// Largest relative dominance violation at hand-over.
         violation: f64,
     },
-    /// A slope covariate is (nearly) a per-level combination of another term's
-    /// columns, so the design has a (near-)null direction spanning both terms.
-    CollinearSlopeCovariate {
-        /// The slope channel carrying the covariate.
-        slope: Channel,
-        /// The term whose columns (nearly) reproduce the covariate.
-        term: usize,
-        /// Share of the covariate's weighted variation outside that term's span.
-        relative_residual: f64,
-        /// Whether the direction spanning both terms left the solve space.
-        verdict: AliasVerdict,
-    },
-}
-
-/// What became of a warned cross-term direction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AliasVerdict {
-    /// A null of the design, kept out of the solve space.
-    Constrained,
-    /// Not certified as a null, so the iteration keeps it.
-    Kept,
 }
 
 impl std::fmt::Display for BuildWarning {
@@ -173,26 +138,6 @@ impl std::fmt::Display for BuildWarning {
                  {iterations} iterations (max relative violation {violation:.2e}); deficits \
                  clamped, preconditioner quality may degrade"
             ),
-            Self::CollinearSlopeCovariate {
-                slope,
-                term,
-                relative_residual,
-                verdict,
-            } => {
-                let fate = match verdict {
-                    AliasVerdict::Constrained => "was removed from the solve space",
-                    AliasVerdict::Kept => {
-                        "was not certified as a null and stays in the solve space, where \
-                         iteration counts can inflate by orders of magnitude"
-                    }
-                };
-                write!(
-                    f,
-                    "slope covariate of {slope} is nearly collinear with the columns of term \
-                     {term} (relative residual {relative_residual:.2e}); the direction spanning \
-                     both terms {fate}"
-                )
-            }
         }
     }
 }

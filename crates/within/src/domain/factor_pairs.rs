@@ -1,35 +1,32 @@
 //! Channel-pair subdomain construction.
 //!
-//! Each cross-factor channel pair becomes a Schwarz subdomain (one per
-//! connected component of its bipartite cross-tab). Overlap is handled by
+//! Each cross-factor channel pair hands approx-chol its Gram factor `V`, one column per
+//! observation, and each irreducible block of the factor becomes a Schwarz subdomain
+//! (isolated levels are batched into diagonal subdomains per side). Overlap is handled by
 //! partition-of-unity weights — see [`schwarz_precond::domain`] for the math.
 //!
 //! Entry point: [`build_local_domains`].
 
+use approx_chol::input::{BipartiteFactorWidth2, FactorWidth1};
+use approx_chol::{BlockFactor, ReduceError};
 use schwarz_precond::{PartitionWeights, SubdomainCore};
 
+use crate::block_solver::BlockSolver;
 use crate::channel::{Channel, ChannelPair};
-use crate::config::LocalSolverConfig;
+use crate::config::{LocalSolverConfig, ScalingFailure};
+use crate::domain::Column;
 use crate::{BuildError, BuildWarning};
 
-use super::{BlockDiagonals, CrossTab, PreparedDesign};
+use super::{PreparedDesign, PreparedTerm};
 
-mod sddm;
-use crate::domain::Loading;
-use sddm::{convert, NotScalable};
-pub(crate) use sddm::{CoordinateMap, Grounding, LocalComponent, MatrixForm, SddmMatrix};
+/// Keeps a batch below the local solver's inner-parallel threshold and typical scratch size.
+const ISOLATED_LEVEL_CHUNK: usize = 4096;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ComponentClass {
-    KnownLaplacian,
-    General,
-}
-
-/// A factor-pair Schwarz domain paired with its validated local operator.
+/// A factor-pair Schwarz domain paired with its factored local operator.
 #[derive(Clone)]
 pub(crate) struct LocalDomain {
     pub(crate) core: SubdomainCore,
-    pub(crate) component: LocalComponent,
+    pub(crate) solver: BlockSolver,
 }
 
 /// Same-factor channel pairs are exactly orthogonal after whitening, so never enumerated.
@@ -58,17 +55,7 @@ pub(crate) fn build_local_domains(
         .collect();
     let per_pair: Vec<(Vec<LocalDomain>, Vec<BuildWarning>)> = pairs
         .par_iter()
-        .map(|&pair| {
-            let (full_ct, full_diag, l2g) = CrossTab::build_for_pair(prepared, pair);
-            let class = if matches!(design.loading(pair.rows), Loading::Constant)
-                && matches!(design.loading(pair.cols), Loading::Constant)
-            {
-                ComponentClass::KnownLaplacian
-            } else {
-                ComponentClass::General
-            };
-            split_into_subdomains(pair, class, full_ct, full_diag, &l2g, config)
-        })
+        .map(|&pair| factor_pair(prepared, pair, config))
         .collect::<Result<_, BuildError>>()?;
     let mut domain_pairs = Vec::new();
     let mut warnings = Vec::new();
@@ -80,7 +67,7 @@ pub(crate) fn build_local_domains(
     // A slope channel breaks `1/√c`'s equal-informativeness assumption (#94), so stay uniform.
     if !channels
         .iter()
-        .any(|&c| design.loading(c).covariate().is_some())
+        .any(|&c| design.column(c) != Column::Intercept)
     {
         compute_partition_weights(&mut domain_pairs, design.n_dofs);
     }
@@ -88,65 +75,92 @@ pub(crate) fn build_local_domains(
     Ok((domain_pairs, warnings))
 }
 
-/// Dead singletons (zero diagonal, an exact-zero design column) produce no subdomain.
-fn split_into_subdomains(
+/// `G = V Vᵀ`, observation `k` adding `√w_k (z_q(k) e_{a_k} + z_r(k) e_{n_q + b_k})`.
+fn factor_pair(
+    prepared: &PreparedDesign<'_>,
     pair: ChannelPair,
-    class: ComponentClass,
-    full_ct: CrossTab,
-    full_diag: BlockDiagonals,
-    l2g: &[u32],
     config: &LocalSolverConfig,
 ) -> Result<(Vec<LocalDomain>, Vec<BuildWarning>), BuildError> {
-    let n_rows_full = full_ct.n_rows();
-    let components = full_ct.bipartite_connected_components();
+    let (rows, cols) = (prepared.term(pair.rows.term), prepared.term(pair.cols.term));
+    fn side<'p>(term: &PreparedTerm<'p>, column: usize) -> FactorWidth1<'p, f64> {
+        FactorWidth1::new(
+            term.term.n_levels(),
+            term.term.levels(),
+            term.loading(column),
+        )
+        .expect("levels index their term")
+    }
+    let (left, right) = (side(&rows, pair.rows.column), side(&cols, pair.cols.column));
+    let v = match prepared.sqrt_weights() {
+        Some(s) => BipartiteFactorWidth2::scaled(left, right, s),
+        None => BipartiteFactorWidth2::new(left, right),
+    }
+    .expect("both sides read the same observations");
+    let factor = approx_chol::factorize_with(v, config.factor_config(), config.scaling_policy()?)
+        .map_err(|e| match e {
+        approx_chol::Error::Reduce(ReduceError::Unscalable { .. }) => {
+            BuildError::UnscalableComponent { pair }
+        }
+        e => BuildError::LocalSolverBuild(e.to_string()),
+    })?;
 
-    let (cross_tabs, diagonals): (Vec<CrossTab>, Vec<Vec<f64>>) = if components.len() == 1 {
-        let flat = full_diag.rows.into_iter().chain(full_diag.cols).collect();
-        (vec![full_ct], vec![flat])
-    } else {
-        let mut row_remap = vec![u32::MAX; full_ct.n_rows()];
-        let mut col_remap = vec![u32::MAX; full_ct.n_cols()];
-        let cross_tabs = components
-            .iter()
-            .map(|comp| full_ct.extract_component(comp, &mut row_remap, &mut col_remap))
-            .collect();
-        let diagonals = components
-            .iter()
-            .map(|comp| full_diag.extract_component(comp))
-            .collect();
-        (cross_tabs, diagonals)
+    let mut warnings = Vec::new();
+    for report in factor
+        .blocks()
+        .iter()
+        .filter_map(BlockFactor::scaling_report)
+        .filter(|report| report.violation > config.scaling.tolerance)
+    {
+        match config.scaling.on_failure {
+            ScalingFailure::Warn => warnings.push(BuildWarning::UnscalableComponent {
+                pair,
+                iterations: report.iterations,
+                violation: report.violation,
+            }),
+            ScalingFailure::Error => return Err(BuildError::UnscalableComponent { pair }),
+        }
+    }
+
+    let n_rows = rows.term.n_levels();
+    let row_base = rows.term.column_dofs(pair.rows.column).start;
+    let col_base = cols.term.column_dofs(pair.cols.column).start;
+    let global = |vertex: usize| {
+        let dof = if vertex < n_rows {
+            row_base + vertex
+        } else {
+            col_base + vertex - n_rows
+        };
+        u32::try_from(dof).expect("the DOF space fits u32")
+    };
+    let domain = |blocks: Vec<BlockFactor>| LocalDomain {
+        core: SubdomainCore::uniform(
+            blocks
+                .iter()
+                .flat_map(BlockFactor::vertices)
+                .map(global)
+                .collect(),
+        ),
+        solver: BlockSolver::new(blocks),
     };
 
-    let mut domains = Vec::with_capacity(components.len());
-    let mut warnings = Vec::new();
-    for ((comp, comp_ct), comp_diag) in components.iter().zip(cross_tabs).zip(diagonals) {
-        if comp_diag.iter().all(|&v| v == 0.0) {
-            continue;
+    let mut domains = Vec::new();
+    let mut isolated = [Vec::new(), Vec::new()];
+    for block in factor.into_blocks() {
+        match block.vertices().len() {
+            1 => isolated[usize::from(block.vertices().all(|v| v >= n_rows))].push(block),
+            _ => domains.push(domain(vec![block])),
         }
-        let comp_globals: Vec<u32> = comp
-            .rows
-            .iter()
-            .map(|&i| l2g[i])
-            .chain(comp.cols.iter().map(|&i| l2g[n_rows_full + i]))
-            .collect();
-        let (comp_ct, comp_diag, comp_globals) =
-            sddm::orient_for_elimination(comp_ct, comp_diag, comp_globals);
-        let (mut component, uncertified) = convert(comp_ct, comp_diag, class, &config.scaling)
-            .map_err(|NotScalable| BuildError::UnscalableComponent { pair })?;
-        if class == ComponentClass::General && component.matrix.grounding == Grounding::Grounded {
-            sddm::add_relative_ridge(&mut component.matrix, config.ridge);
+    }
+    // Isolated levels have a diagonal Gram, so batching changes no local solve, only overhead.
+    for side in isolated {
+        let mut side = side.into_iter();
+        loop {
+            let batch: Vec<BlockFactor> = side.by_ref().take(ISOLATED_LEVEL_CHUNK).collect();
+            if batch.is_empty() {
+                break;
+            }
+            domains.push(domain(batch));
         }
-        if let Some(uncertified) = uncertified {
-            warnings.push(BuildWarning::UnscalableComponent {
-                pair,
-                iterations: uncertified.iterations,
-                violation: uncertified.violation,
-            });
-        }
-        domains.push(LocalDomain {
-            core: schwarz_precond::SubdomainCore::uniform(comp_globals),
-            component,
-        });
     }
     Ok((domains, warnings))
 }
@@ -276,6 +290,30 @@ mod tests {
             counts.iter().any(|&c| c > 1),
             "test is vacuous: build a design whose subdomains share a DOF"
         );
+    }
+
+    #[test]
+    fn isolated_levels_batch_per_side_and_dead_levels_drop() {
+        // ±z within one firm cancels a cross cell to exactly zero; worker 4's zero z is dead.
+        let workers = [0u32, 0, 1, 1, 2, 2, 3, 3, 4];
+        let firms = [0u32, 0, 2, 2, 0, 1, 3, 3, 0];
+        let z = [1.0, -1.0, 2.0, -2.0, 1.0, 1.0, 3.0, -3.0, 0.0];
+        let design = Design::new(vec![
+            Effect::new(&workers, false, [&z[..]]).expect("slope effect"),
+            Effect::new(&firms, true, []).expect("firm effect"),
+        ])
+        .expect("valid design");
+        let prepared = PreparedDesign::unweighted_for_test(design);
+        let (domains, _) =
+            build_local_domains(&prepared, &LocalSolverConfig::default()).expect("domains");
+        let mut cores: Vec<Vec<u32>> = domains
+            .iter()
+            .map(|d| d.core.global_indices().to_vec())
+            .collect();
+        cores.iter_mut().for_each(|core| core.sort_unstable());
+        cores.sort_unstable();
+        // Workers occupy DOFs 0..5 and firms 5..9.
+        assert_eq!(cores, [vec![0, 1, 3], vec![2, 5, 6], vec![7, 8]]);
     }
 
     #[test]

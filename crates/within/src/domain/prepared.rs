@@ -1,13 +1,41 @@
-use super::{row_weight, Design, SlopeReparam};
+use std::sync::OnceLock;
+
+use rayon::prelude::*;
+
+use super::{row_weight, Column, Design, ScatterSplit, Term, TermReparam};
+use crate::channel::CoefficientPosition;
+use crate::linalg::add_compensated;
 use crate::BuildError;
 
-/// A [`Design`] plus all state one weight vector determines.
+/// A [`Design`] plus the solve state it and one weight vector determine.
 pub(crate) struct PreparedDesign<'a> {
     pub(crate) design: Design<'a>,
     /// `W^{1/2}` in the design's internal observation order; `None` is unweighted.
     sqrt_weights: Option<Vec<f64>>,
-    /// `None` for slope-free designs.
-    pub(crate) reparam: Option<SlopeReparam>,
+    /// Per design term, its change of basis; `None` is the identity.
+    reparams: Vec<Option<TermReparam>>,
+    /// Per design term, its block of [`Self::gram_diagonal`], filled on first read.
+    diagonals: Vec<OnceLock<Box<[f64]>>>,
+    /// Per design term, how its adjoint scatter-add splits into parallel pieces.
+    splits: Vec<ScatterSplit>,
+}
+
+/// A term in the solve basis: the design's rows plus this preparation's whitened slopes.
+pub(crate) struct PreparedTerm<'p> {
+    pub(crate) term: &'p Term<'p>,
+    /// Solve-basis slopes in coefficient-column order; empty for a slope-free term.
+    pub(crate) slopes: &'p [Vec<f64>],
+    pub(crate) split: &'p ScatterSplit,
+}
+
+impl<'p> PreparedTerm<'p> {
+    /// Column `column`'s solve-basis loading; `None` is the intercept.
+    pub(crate) fn loading(&self, column: usize) -> Option<&'p [f64]> {
+        match self.term.column(column) {
+            Column::Intercept => None,
+            Column::Slope(j) => Some(&self.slopes[j]),
+        }
+    }
 }
 
 impl<'a> PreparedDesign<'a> {
@@ -15,11 +43,18 @@ impl<'a> PreparedDesign<'a> {
         let sqrt_weights = weights
             .map(|weights| prepare_sqrt_weights(&design, weights))
             .transpose()?;
-        let reparam = SlopeReparam::build(&design, sqrt_weights.as_deref());
+        let reparams: Vec<Option<TermReparam>> = (0..design.n_factors())
+            .into_par_iter()
+            .map(|t| TermReparam::build(&design, t, sqrt_weights.as_deref()))
+            .collect();
+        let diagonals = (0..design.n_factors()).map(|_| OnceLock::new()).collect();
+        let splits = design.terms.par_iter().map(ScatterSplit::new).collect();
         Ok(Self {
             design,
             sqrt_weights,
-            reparam,
+            reparams,
+            diagonals,
+            splits,
         })
     }
 
@@ -29,19 +64,107 @@ impl<'a> PreparedDesign<'a> {
         self.sqrt_weights.as_deref()
     }
 
-    /// The Gram weight of row `obs`: the operator applies `s`, so its normal matrix carries `s²`.
-    #[inline]
-    pub(crate) fn row_weight(&self, obs: usize) -> f64 {
-        row_weight(self.sqrt_weights(), obs)
+    pub(crate) fn term(&self, term: usize) -> PreparedTerm<'_> {
+        let (t, reparam) = (&self.design.terms[term], &self.reparams[term]);
+        let slopes: &[Vec<f64>] = reparam.as_ref().map_or(&[], |r| &r.slopes);
+        debug_assert_eq!(slopes.len(), t.raw_slopes().len());
+        PreparedTerm {
+            term: t,
+            slopes,
+            split: &self.splits[term],
+        }
     }
 
-    /// Loading column `column` in the solve basis.
-    pub(crate) fn loading_column(&self, column: usize) -> &[f64] {
-        // Only slope terms reference loading columns, and any slope term makes `reparam` `Some`.
-        self.reparam
-            .as_ref()
-            .expect("loading column on a slope-free design")
-            .loading_column(column)
+    pub(crate) fn terms(&self) -> impl ExactSizeIterator<Item = PreparedTerm<'_>> {
+        (0..self.design.n_factors()).map(|term| self.term(term))
+    }
+
+    /// Term `term`'s block of `diag(AᵀA)`, laid out like its `dofs()`, summed in observation order.
+    fn diagonal(&self, term: usize) -> &[f64] {
+        // Serial fill: a rayon job stolen inside it could re-enter this cell and deadlock.
+        self.diagonals[term].get_or_init(|| {
+            let prepared = self.term(term);
+            let (term, sqrt_weights) = (prepared.term, self.sqrt_weights());
+            let levels = term.levels();
+            let mut diag = vec![0.0; term.n_dofs()];
+            let mut corrections = vec![0.0; term.n_dofs()];
+            if !prepared.slopes.is_empty() {
+                let columns: Vec<(usize, Option<&[f64]>)> = (0..term.n_columns())
+                    .map(|c| (term.column_dofs(c).start - term.offset, prepared.loading(c)))
+                    .collect();
+                for (obs, &level) in levels.iter().enumerate() {
+                    let w = row_weight(sqrt_weights, obs);
+                    for &(base, z) in &columns {
+                        // Keep `w * z * z` left-to-right: a zero weight kills a huge `z` first.
+                        let slot = base + level as usize;
+                        add_compensated(
+                            &mut diag[slot],
+                            &mut corrections[slot],
+                            z.map_or(w, |z| w * z[obs] * z[obs]),
+                        );
+                    }
+                }
+            } else if term.sorted() {
+                // A sorted level is one run: a register sum keeps its order with no store per row.
+                let mut start = 0;
+                for run in levels.chunk_by(|a, b| a == b) {
+                    let rows = start..start + run.len();
+                    start = rows.end;
+                    // A sum of ones is exact, so the unweighted run sum is its length.
+                    diag[run[0] as usize] += match sqrt_weights {
+                        None => run.len() as f64,
+                        Some(s) => {
+                            let (mut sum, mut correction) = (0.0, 0.0);
+                            for &si in &s[rows] {
+                                add_compensated(&mut sum, &mut correction, si * si);
+                            }
+                            sum + correction
+                        }
+                    };
+                }
+            } else {
+                for (obs, &level) in levels.iter().enumerate() {
+                    let level = level as usize;
+                    add_compensated(
+                        &mut diag[level],
+                        &mut corrections[level],
+                        row_weight(sqrt_weights, obs),
+                    );
+                }
+            }
+            for (entry, correction) in diag.iter_mut().zip(corrections) {
+                *entry += correction;
+            }
+            diag.into_boxed_slice()
+        })
+    }
+
+    /// `diag(AᵀA)` in solve coordinates.
+    pub(crate) fn gram_diagonal(&self) -> Vec<f64> {
+        let blocks: Vec<&[f64]> = (0..self.design.n_factors())
+            .into_par_iter()
+            .map(|term| self.diagonal(term))
+            .collect();
+        let diag = blocks.concat();
+        debug_assert_eq!(diag.len(), self.design.n_dofs);
+        diag
+    }
+
+    /// Map solve-basis coefficients back to the user's parametrization.
+    pub(crate) fn back_transform(&self, x: &mut [f64]) {
+        for (t, reparam) in self.design.terms.iter().zip(&self.reparams) {
+            if let Some(reparam) = reparam {
+                reparam.back_transform(t, x);
+            }
+        }
+    }
+
+    /// Directions the data cannot identify, ascending in `(term, level, column)`.
+    pub(crate) fn unidentified(&self) -> impl Iterator<Item = CoefficientPosition> + '_ {
+        self.reparams
+            .iter()
+            .flatten()
+            .flat_map(|r| r.unidentified.iter().copied())
     }
 }
 
@@ -94,10 +217,134 @@ mod tests {
         assert_eq!(prepared.sqrt_weights(), Some(&[2.0, 4.0, 3.0, 1.0][..]));
         assert_eq!(
             (0..4)
-                .map(|obs| prepared.row_weight(obs))
+                .map(|obs| row_weight(prepared.sqrt_weights(), obs))
                 .collect::<Vec<_>>(),
             [4.0, 16.0, 9.0, 1.0]
         );
+    }
+
+    /// Independent floating-point expansion: retain each exact two-sum remainder
+    /// before rounding the short expansion, rather than reusing Neumaier's kernel.
+    fn expansion_sum(values: Vec<f64>) -> f64 {
+        let mut partials: Vec<f64> = Vec::new();
+        for mut x in values {
+            let mut kept = 0;
+            for i in 0..partials.len() {
+                let mut y = partials[i];
+                if x.abs() < y.abs() {
+                    std::mem::swap(&mut x, &mut y);
+                }
+                let hi = x + y;
+                let lo = y - (hi - x);
+                if lo != 0.0 {
+                    partials[kept] = lo;
+                    kept += 1;
+                }
+                x = hi;
+            }
+            partials.truncate(kept);
+            partials.push(x);
+        }
+        let mut hi = partials.pop().unwrap_or(0.0);
+        let mut lo = 0.0;
+        while let Some(y) = partials.pop() {
+            let x = hi;
+            hi = x + y;
+            lo = y - (hi - x);
+            if lo != 0.0 {
+                break;
+            }
+        }
+        // A same-sign tail resolves a halfway rounding at the leading pair.
+        if partials.last().is_some_and(|tail| lo * tail > 0.0) {
+            let twice = 2.0 * lo;
+            let rounded = hi + twice;
+            if rounded - hi == twice {
+                hi = rounded;
+            }
+        }
+        hi
+    }
+
+    /// Explicit per-column, per-level contributions, independently summed.
+    fn observation_sums(prepared: &PreparedDesign<'_>) -> Vec<f64> {
+        let mut entries = vec![Vec::new(); prepared.design.n_dofs];
+        for term in prepared.terms() {
+            for column in 0..term.term.n_columns() {
+                let block = &mut entries[term.term.column_dofs(column)];
+                let z = term.loading(column);
+                for (obs, &level) in term.term.levels().iter().enumerate() {
+                    let w = row_weight(prepared.sqrt_weights(), obs);
+                    block[level as usize].push(z.map_or(w, |z| w * z[obs] * z[obs]));
+                }
+            }
+        }
+        entries.into_iter().map(expansion_sum).collect()
+    }
+
+    #[test]
+    fn gram_diagonal_matches_independent_expansion_sums() {
+        // Level 1 of `f` has z1 = 2·z0 (a rank drop).
+        let f = [0u32, 1, 0, 1, 0, 1, 2, 2];
+        let z0 = [1.0, 2.0, 3.0, 4.0, 5.5, 6.0, 0.3, 0.7];
+        let z1 = [9.0, 4.0, 1.0, 8.0, 2.0, 12.0, 5.0, 1.1];
+        let g = [2u32, 0, 1, 1, 0, 2, 0, 1];
+        let h = [1u32, 0, 0, 1, 1, 0, 1, 0];
+        let zh = [0.5, 1.5, -2.0, 3.0, 0.25, -1.0, 7.0, 2.0];
+        // Nested in `f`, so it comes out sorted and is summed by runs.
+        let p = [0u32, 1, 0, 1, 0, 1, 1, 1];
+        let weights = [2.0, 0.0, 3.0, 0.1, 1.0, 7.0, 0.3, 5.0];
+        for weights in [None, Some(&weights[..])] {
+            let effects = vec![
+                crate::Effect::new(&f, true, [&z0[..], &z1[..]]).unwrap(),
+                crate::Effect::new(&g, true, []).unwrap(),
+                crate::Effect::new(&h, false, [&zh[..]]).unwrap(),
+                crate::Effect::new(&p, true, []).unwrap(),
+            ];
+            let prepared = PreparedDesign::new(Design::new(effects).unwrap(), weights).unwrap();
+            let terms = &prepared.design.terms;
+            assert!(terms[3].sorted() && !terms[1].sorted());
+            assert!(prepared.unidentified().next().is_some());
+            assert_eq!(
+                prepared.gram_diagonal(),
+                observation_sums(&prepared),
+                "weights {weights:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gram_diagonal_matches_hand_computed_values() {
+        // `z` is constant in level 1 of `f`, so that level's slope is dropped.
+        let f = [0u32, 0, 0, 1, 1, 2, 2];
+        let z = [1.0, 2.0, 4.0, 3.0, 3.0, 5.0, 7.0];
+        let g = [0u32, 1, 0, 1, 0, 1, 1];
+        // Perfect squares, so `(√w)²` is exact.
+        let weights = [1.0, 4.0, 9.0, 0.25, 4.0, 1.0, 16.0];
+        for (weights, f_sums, g_sums) in [
+            (None, [3.0, 2.0, 2.0], [3.0, 4.0]),
+            (Some(&weights[..]), [14.0, 4.25, 17.0], [14.0, 21.25]),
+        ] {
+            let effects = vec![
+                crate::Effect::new(&f, true, [&z[..]]).unwrap(),
+                crate::Effect::new(&g, true, []).unwrap(),
+            ];
+            let prepared = PreparedDesign::new(Design::new(effects).unwrap(), weights).unwrap();
+            let diag = prepared.gram_diagonal();
+            let block =
+                |term: usize, column| &diag[prepared.design.terms[term].column_dofs(column)];
+            assert_eq!(block(0, 0), f_sums);
+            assert_eq!(block(1, 0), g_sums);
+            // A kept whitened slope has unit weighted norm; a dropped one is an exact-zero column.
+            let slope = block(0, 1);
+            assert_eq!(slope[1], 0.0, "weights {weights:?}");
+            for level in [0, 2] {
+                assert!(
+                    (slope[level] - 1.0).abs() < 1e-12,
+                    "{slope:?}, weights {weights:?}"
+                );
+            }
+        }
     }
 
     #[test]

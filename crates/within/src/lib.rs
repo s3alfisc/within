@@ -16,26 +16,18 @@
 //!
 //! # Reproducibility
 //!
-//! A single-threaded run (a one-thread Rayon pool, or `RAYON_NUM_THREADS=1`)
-//! is bitwise-reproducible. Parallel reductions sum in an order that depends on
-//! the Rayon width, so coefficients from different thread counts differ at the
-//! ULP scale — reproducible within solver tolerance, not bitwise. Pinning the
-//! Rayon width across runs holds estimates stable within solver tolerance (and
-//! is bitwise in practice at a fixed width, though only the single-threaded
-//! case is a guarantee); when the width may vary, also pin an explicit
-//! [`ReductionStrategy`] rather than [`ReductionStrategy::Auto`], which selects
-//! its backend from the width.
+//! A solve returns the same bits at any Rayon width, run after run: every parallel
+//! sum is split where the data says, every parallel build is put back in a fixed order,
+//! and the width only decides how many pieces run at once.
 //!
 //! [`PreconditionerConfig::Adaptive`] reproduces raw coefficients per solve, not
 //! across solves; fitted values agree.
 
 pub mod config;
 pub mod error;
-pub mod observation;
 
-pub(crate) mod block_elim;
+pub(crate) mod block_solver;
 pub(crate) mod channel;
-pub(crate) mod csr_block;
 pub(crate) mod domain;
 pub(crate) mod linalg;
 pub(crate) mod operator;
@@ -44,10 +36,10 @@ pub(crate) mod solver;
 pub use channel::{Channel, ChannelPair, CoefficientAddress};
 pub use config::{
     ApproxCholConfig, ApproxSchurConfig, LocalSolverConfig, LsmrOptions, PreconditionerConfig,
-    ReductionStrategy, ScalingConfig, ScalingFailure, SchurMode, Staleness, StalenessError,
+    ScalingConfig, ScalingFailure, SchurMode, Staleness, StalenessError,
 };
 pub use domain::{Design, Effect};
-pub use error::{AliasVerdict, BuildError, BuildWarning, SolveError, WithinError};
+pub use error::{BuildError, BuildWarning, SolveError, WithinError};
 pub use operator::schwarz::Preconditioner;
 pub use solver::{
     solve, solve_batch, BatchSolveResult, CoefficientLayout, IntoDesign, PreconditionerInput,
