@@ -8,339 +8,309 @@ assert_equal <- function(a, b, tol = 0, msg = "Values are not equal.") {
 }
 
 assert_error <- function(expr, contains = NULL, msg = "Expected an error, but none occurred.") {
-  got <- tryCatch(
-    {
-      force(expr)
-      NULL
-    },
-    error = function(e) e
-  )
+  got <- tryCatch({
+    force(expr)
+    NULL
+  }, error = function(e) e)
   if (is.null(got)) stop(msg, call. = FALSE)
   if (!is.null(contains) && !grepl(contains, conditionMessage(got), fixed = TRUE)) {
-    stop(
-      sprintf("Expected error containing '%s', got: %s", contains, conditionMessage(got)),
-      call. = FALSE
-    )
+    stop(sprintf("Expected error containing '%s', got: %s", contains, conditionMessage(got)),
+         call. = FALSE)
   }
 }
 
-assert_all_converged <- function(result, msg) {
-  assert_true(all(result$converged), msg)
-}
+printed <- function(x) paste(utils::capture.output(print(x)), collapse = "\n")
 
 withinr_run_tests <- function(verbose = TRUE) {
   if (!requireNamespace("withinr", quietly = TRUE)) {
     stop("Package 'withinr' must be installed or loaded first.", call. = FALSE)
   }
+  P <- withinr::PreconditionerConfig
 
   cats_2x2 <- matrix(c(1L, 1L, 2L, 2L,
                        1L, 2L, 1L, 2L), ncol = 2)
   y_simple <- c(1.0, 2.0, 3.0, 4.0)
 
-  # solve() smoke
+  # -------------------------------------------------------------------------
+  # Configuration objects: validated natively, fully resolved, comparable
+  # -------------------------------------------------------------------------
+  opts <- withinr::LsmrOptions(tol = 1e-10, maxiter = 2000, local_size = 2)
+  assert_equal(opts$maxiter, 2000L, msg = "LsmrOptions maxiter not normalized to integer.")
+  assert_true(is.integer(opts$local_size), "LsmrOptions local_size not integer.")
+  assert_true(is.null(withinr::LsmrOptions()$local_size), "LsmrOptions default local_size not NULL.")
+  assert_error(withinr::LsmrOptions(tol = -1), "tol")
+  assert_error(withinr::LsmrOptions(maxiter = 1.5), "maxiter")
+
+  local <- withinr::LocalSolverConfig()
+  assert_equal(local$approx_chol$split_merge, 2L, msg = "LocalSolverConfig default approx_chol not resolved.")
+  assert_equal(local$schur$mode, "approximate", msg = "Default Schur mode is not approximate.")
+  assert_equal(local$scaling$on_failure, "warn", msg = "Default scaling policy is not warn.")
+  assert_equal(withinr::Schur$exact()$mode, "exact", msg = "Schur$exact() mode mismatch.")
+  assert_equal(withinr::Schur$approximate(withinr::ApproxSchurConfig(split = 3))$config$split, 3L,
+               msg = "Schur$approximate() lost its config.")
+  assert_error(withinr::ApproxSchurConfig(split = 0), "split")
+  assert_error(withinr::ScalingConfig(on_failure = "explode"), "on_failure")
+  assert_error(withinr::LocalSolverConfig(schur = "exact"), "Schur$approximate()")
+
+  stall <- withinr::Staleness()
+  assert_equal(c(stall$window, stall$threshold), c(4, 0.7), msg = "Staleness defaults mismatch.")
+  assert_error(withinr::Staleness(window = 0), "positive")
+  assert_error(withinr::Staleness(threshold = 1), "threshold")
+
+  assert_true(identical(P$Adaptive(), P$Adaptive(withinr::LocalSolverConfig(), withinr::Staleness())),
+              "Equal Adaptive configs are not identical().")
+  assert_true(!identical(P$Adaptive(), P$Additive()), "Adaptive and Additive compare equal.")
+  assert_equal(P$Off()$variant, "Off", msg = "Off variant mismatch.")
+  assert_true(grepl("PreconditionerConfig$Adaptive(", printed(P$Adaptive()), fixed = TRUE),
+              "PreconditionerConfig print mismatch.")
+  assert_true(grepl("Schur$exact()", printed(withinr::LocalSolverConfig(schur = withinr::Schur$exact())),
+                    fixed = TRUE), "Schur print mismatch.")
+
+  # -------------------------------------------------------------------------
+  # One-shot solve: result shape, layout, correctness
+  # -------------------------------------------------------------------------
   r <- withinr::within_solve(cats_2x2, y_simple)
-  assert_true(is.list(r), "solve() did not return a list.")
-  assert_equal(
-    names(r),
-    c(
-      "x", "unidentified", "warnings", "layout", "demeaned", "converged",
-      "iterations", "residual", "time_total", "time_setup", "time_solve"
-    ),
-    msg = "solve() returned unexpected list fields."
-  )
-  assert_true(is.list(r$unidentified), "solve() unidentified metadata is not a list.")
-  assert_true(is.character(r$warnings), "solve() warnings metadata is not character.")
-  assert_true(
-    inherits(r$layout, "within_coefficient_layout"),
-    "solve() layout metadata is not a coefficient-layout handle."
-  )
-  assert_equal(r$layout$n_dofs, length(r$x), msg = "layout$n_dofs mismatch.")
-  first_address <- r$layout$address(1L)
-  assert_equal(
-    r$layout$index(first_address$term, first_address$level, first_address$column),
-    1L,
-    msg = "layout index/address round trip failed."
-  )
-  assert_true(isTRUE(r$converged), "solve() did not converge on smoke case.")
-  assert_true(is.double(r$x), "solve() x is not double.")
-  assert_true(is.double(r$demeaned), "solve() demeaned output is not double.")
-  assert_true(length(r$demeaned) == length(y_simple), "solve() demeaned length mismatch.")
-  assert_true(r$iterations >= 0L, "solve() iterations is negative.")
-  assert_true(r$residual >= 0, "solve() residual is negative.")
-  assert_true(r$time_total >= 0, "solve() time_total is negative.")
+  assert_true(inherits(r, "within_solve_result"), "within_solve() result class mismatch.")
+  assert_equal(names(r), c("x", "unidentified", "layout", "demeaned", "converged", "iterations",
+                           "residual", "time_total", "time_setup", "time_solve"),
+               msg = "within_solve() returned unexpected fields.")
+  assert_true(is.data.frame(r$unidentified), "unidentified is not a data frame.")
+  assert_equal(names(r$unidentified), c("term", "level", "column"), msg = "unidentified columns.")
+  assert_true(isTRUE(r$converged), "within_solve() did not converge on the smoke case.")
+  assert_true(is.double(r$x) && is.double(r$demeaned), "x / demeaned are not double.")
+  assert_true(r$iterations >= 0L && r$residual >= 0 && r$time_total >= 0, "Bad solve metadata.")
+  assert_true(identical(coef(r), r$x) && identical(residuals(r), r$demeaned), "coef()/residuals().")
+  assert_true(grepl("<within_solve_result>", printed(r), fixed = TRUE), "Result print mismatch.")
 
-  opts <- withinr::LsmrOptions(tol = 1e-10, maxiter = 2000L, local_size = 2L)
-  assert_true(withinr::within_solve(cats_2x2, y_simple, options = opts)$converged, "Custom options failed.")
-  assert_true(
-    withinr::within_solve(cats_2x2, y_simple, preconditioner = withinr::PreconditionerConfig$Off)$converged,
-    "Unpreconditioned solve failed."
-  )
-  assert_true(
-    withinr::within_solve(cats_2x2, y_simple, preconditioner = withinr::PreconditionerConfig$Diagonal)$converged,
-    "Diagonal preconditioner solve failed."
-  )
-  schwarz <- withinr::AdditiveSchwarz(
-    local_solver = withinr::LocalSolverConfig(
-      approx_chol = withinr::ApproxCholConfig(split_merge = 2L),
-      schur = withinr::Schur$Approximate(withinr::ApproxSchurConfig(split = 1L)),
-      scaling = withinr::ScalingConfig(on_failure = withinr::ScalingFailure$Warn),
-      ridge = 1e-10
-    ),
-    reduction = withinr::ReductionStrategy$Auto
-  )
-  assert_true(withinr::within_solve(cats_2x2, y_simple, preconditioner = schwarz)$converged, "AdditiveSchwarz config failed.")
+  layout <- r$layout
+  assert_true(inherits(layout, "within_coefficient_layout"), "layout class mismatch.")
+  assert_equal(layout$n_dofs(), length(r$x), msg = "layout$n_dofs() mismatch.")
+  assert_equal(layout$n_terms(), 2L, msg = "layout$n_terms() mismatch.")
+  assert_equal(c(layout$n_levels(1), layout$n_columns(1)), c(2L, 1L), msg = "layout per-term sizes.")
+  addresses <- layout$address(seq_len(layout$n_dofs()))
+  assert_equal(layout$index(addresses$term, addresses$level, addresses$column), seq_len(layout$n_dofs()),
+               msg = "layout index/address round trip failed.")
+  assert_error(layout$n_levels(3), "out of range")
+  assert_error(layout$index(1, 9, 1), "out of range")
+  assert_error(layout$address(0), "positive")
+  assert_true(grepl("CoefficientLayout(n_terms=2", printed(layout), fixed = TRUE), "layout print.")
 
-  w <- c(1.0, 2.0, 1.0, 2.0)
-  assert_true(withinr::within_solve(cats_2x2, y_simple, weights = w)$converged, "Weighted solve failed.")
+  d <- r$demeaned
+  assert_equal(c(d[1] + d[2], d[3] + d[4], d[1] + d[3], d[2] + d[4]), rep(0, 4), tol = 1e-6,
+               msg = "Group means not centered.")
+  y_hat <- r$x[layout$index(1, cats_2x2[, 1], 1)] + r$x[layout$index(2, cats_2x2[, 2], 1)]
+  assert_equal(y_hat + r$demeaned, y_simple, tol = 1e-6, msg = "y != D x + demeaned.")
 
-  # solve() correctness checks
-  d <- withinr::within_solve(cats_2x2, y_simple)$demeaned
-  assert_equal(d[1] + d[2], 0, tol = 1e-6, msg = "Factor-1 group mean not centered (group 1).")
-  assert_equal(d[3] + d[4], 0, tol = 1e-6, msg = "Factor-1 group mean not centered (group 2).")
-  assert_equal(d[1] + d[3], 0, tol = 1e-6, msg = "Factor-2 group mean not centered (group 1).")
-  assert_equal(d[2] + d[4], 0, tol = 1e-6, msg = "Factor-2 group mean not centered (group 2).")
+  # Preconditioner choices, options as LsmrOptions or a plain list, weights.
+  for (precond in list(P$Off(), P$Diagonal(), P$Additive(), P$Adaptive(), "off", "diagonal",
+                       "additive", "adaptive")) {
+    assert_true(withinr::within_solve(cats_2x2, y_simple, preconditioner = precond)$converged,
+                "A preconditioner choice failed to converge.")
+  }
+  schwarz <- P$Additive(withinr::LocalSolverConfig(
+    approx_chol = withinr::ApproxCholConfig(seed = 7, split_merge = 2),
+    schur = withinr::Schur$approximate(withinr::ApproxSchurConfig(split = 1)),
+    dense_threshold = 0,
+    scaling = withinr::ScalingConfig(tolerance = 1e-8, max_iterations = 100, on_failure = "warn")
+  ))
+  assert_true(withinr::within_solve(cats_2x2, y_simple, preconditioner = schwarz)$converged,
+              "Tuned Additive config failed.")
+  exact <- P$Additive(withinr::LocalSolverConfig(schur = withinr::Schur$exact()))
+  assert_true(withinr::within_solve(cats_2x2, y_simple, preconditioner = exact)$converged,
+              "Exact Schur config failed.")
+  assert_true(withinr::within_solve(cats_2x2, y_simple, options = opts)$converged, "LsmrOptions failed.")
+  assert_true(withinr::within_solve(cats_2x2, y_simple, options = list(tol = 1e-12))$converged,
+              "List options failed.")
+  assert_true(withinr::within_solve(cats_2x2, y_simple, weights = c(1, 2, 1, 2))$converged,
+              "Weighted solve failed.")
+  assert_error(withinr::within_solve(cats_2x2, y_simple, preconditioner = "bogus"), "should be one of")
+  assert_error(withinr::within_solve(cats_2x2, y_simple, preconditioner = 3), "preconditioner")
+  assert_error(withinr::within_solve(cats_2x2, y_simple, options = 3), "options")
 
-  r2 <- withinr::within_solve(cats_2x2, y_simple)
-  n1 <- 2L
-  y_hat <- r2$x[cats_2x2[, 1]] + r2$x[n1 + cats_2x2[, 2]]
-  assert_equal(y_hat + r2$demeaned, y_simple, tol = 1e-6, msg = "Reconstruction y != y_hat + demeaned.")
-
-  # solve_batch() smoke
-  Y <- cbind(y_simple, rev(y_simple))
+  # -------------------------------------------------------------------------
+  # Batch solve
+  # -------------------------------------------------------------------------
+  Y <- cbind(a = y_simple, b = rev(y_simple))
   b <- withinr::within_solve_batch(cats_2x2, Y)
-  assert_true(is.matrix(b$x), "solve_batch() x is not matrix.")
-  assert_true(is.matrix(b$demeaned), "solve_batch() demeaned are not matrix.")
-  assert_true(ncol(b$x) == 2L, "solve_batch() x column count mismatch.")
-  assert_true(ncol(b$demeaned) == 2L, "solve_batch() demeaned column count mismatch.")
-  assert_true(nrow(b$demeaned) == 4L, "solve_batch() demeaned row count mismatch.")
-  assert_true(length(b$converged) == 2L, "solve_batch() converged vector length mismatch.")
-  assert_true(all(b$converged), "solve_batch() did not converge for all RHS.")
-  assert_true(b$time_setup >= 0, "solve_batch() time_setup is negative.")
-
+  assert_true(inherits(b, "within_batch_solve_result"), "Batch result class mismatch.")
+  assert_true(is.matrix(b$x) && is.matrix(b$demeaned), "Batch x / demeaned are not matrices.")
+  assert_equal(dim(b$demeaned), c(4L, 2L), msg = "Batch demeaned shape mismatch.")
+  assert_equal(colnames(b$demeaned), c("a", "b"), msg = "Batch colnames not carried over.")
+  assert_equal(names(b$converged), c("a", "b"), msg = "Batch per-RHS names not carried over.")
+  assert_true(all(b$converged) && b$time_setup >= 0, "Batch metadata mismatch.")
   s1 <- withinr::within_solve(cats_2x2, Y[, 1])
   s2 <- withinr::within_solve(cats_2x2, Y[, 2])
-  assert_equal(b$x[, 1], s1$x, tol = 1e-6, msg = "Batch x RHS1 mismatch.")
-  assert_equal(b$x[, 2], s2$x, tol = 1e-6, msg = "Batch x RHS2 mismatch.")
-  assert_equal(b$demeaned[, 1], s1$demeaned, tol = 1e-6, msg = "Batch demeaned RHS1 mismatch.")
-  assert_equal(b$demeaned[, 2], s2$demeaned, tol = 1e-6, msg = "Batch demeaned RHS2 mismatch.")
+  assert_equal(b$demeaned, cbind(s1$demeaned, s2$demeaned), tol = 1e-6, msg = "Batch != singles.")
+  assert_equal(withinr::within_solve_batch(cats_2x2, as.data.frame(Y))$demeaned, b$demeaned,
+               tol = 1e-12, msg = "Data-frame Y mismatch.")
+  assert_equal(dim(withinr::within_solve_batch(cats_2x2, Y[, 0, drop = FALSE])$x), c(4L, 0L),
+               msg = "Empty batch not well shaped.")
+  assert_error(withinr::within_solve_batch(cats_2x2, y_simple), "numeric matrix")
+  assert_error(withinr::within_solve_batch(cats_2x2, Y[-1, ]), "rows")
 
-  # Persistent Solver and Preconditioner reuse
-  solver <- withinr::Solver(cats_2x2, preconditioner = withinr::PreconditionerConfig$Additive)
-  assert_true(inherits(solver, "within_solver"), "Solver() did not return a solver object.")
-  assert_equal(solver$n_obs, 4L, msg = "solver$n_obs mismatch.")
-  assert_true(solver$n_dofs >= 4L, "solver$n_dofs is too small.")
-  p <- solver$preconditioner()
-  assert_true(inherits(p, "within_preconditioner"), "solver$preconditioner() did not return a preconditioner.")
-  assert_true(
-    grepl("Preconditioner(Additive", paste(capture.output(print(p)), collapse = ""), fixed = TRUE),
-    "preconditioner print does not report the Additive variant."
-  )
-  assert_equal(length(p$apply(rep(1, p$ncols))), p$nrows, msg = "preconditioner apply length mismatch.")
-  assert_true(p$build_duration_seconds >= 0, "preconditioner build duration is negative.")
-  assert_equal(p$config$variant, "Additive", msg = "preconditioner config variant mismatch.")
-
-  solver_diag <- withinr::Solver(cats_2x2, preconditioner = withinr::PreconditionerConfig$Diagonal)
-  p_diag <- solver_diag$preconditioner()
-  assert_true(
-    grepl("Preconditioner(Diagonal", paste(capture.output(print(p_diag)), collapse = ""), fixed = TRUE),
-    "diagonal preconditioner print does not report the Diagonal variant."
-  )
-
-  r_persistent <- solver$solve(y_simple)
-  assert_equal(r_persistent$demeaned, s1$demeaned, tol = 1e-6, msg = "Persistent solve mismatch.")
-  b_persistent <- solver$solve_batch(Y)
-  assert_equal(b_persistent$demeaned, b$demeaned, tol = 1e-6, msg = "Persistent batch mismatch.")
-
-  bytes <- p$serialize()
-  p2 <- withinr::Preconditioner(bytes)
-  assert_true(
-    grepl("Preconditioner(Additive", paste(capture.output(print(p2)), collapse = ""), fixed = TRUE),
-    "deserialized preconditioner print does not report the Additive variant."
-  )
-  solver2 <- withinr::Solver(cats_2x2, preconditioner = p2)
-  assert_equal(solver2$solve(y_simple)$demeaned, s1$demeaned, tol = 1e-6, msg = "Preconditioner reuse mismatch.")
-
-  # validation/error behavior
-  assert_error(withinr::within_solve(c(1L, 2L), y_simple), contains = "category matrix")
-  assert_error(withinr::within_solve_batch(cats_2x2, y_simple), contains = "must be a matrix")
+  # -------------------------------------------------------------------------
+  # R-native design inputs
+  # -------------------------------------------------------------------------
+  df <- data.frame(firm = factor(c("x", "x", "y", "y")), year = c("a", "b", "a", "b"))
+  assert_equal(withinr::within_solve(df, y_simple)$demeaned, s1$demeaned, tol = 1e-8,
+               msg = "Data-frame design mismatch.")
+  cats_dbl <- matrix(as.double(cats_2x2), ncol = 2)
+  assert_equal(withinr::within_solve(cats_dbl, y_simple)$demeaned, s1$demeaned, tol = 1e-8,
+               msg = "Numeric matrix design mismatch.")
+  assert_equal(withinr::within_solve(cats_2x2 - 1L, y_simple)$demeaned, s1$demeaned, tol = 1e-8,
+               msg = "0-based labels mismatch.")
+  one_way <- withinr::within_solve(c(1, 1, 2, 2), y_simple)
+  assert_equal(one_way$demeaned, c(-0.5, 0.5, -0.5, 0.5), tol = 1e-8, msg = "Vector design mismatch.")
 
   bad <- cats_2x2
   bad[1, 1] <- NA_integer_
-  assert_error(withinr::within_solve(bad, y_simple), contains = "no NAs")
-
-  bad0 <- cats_2x2 - 1L
-  assert_error(withinr::within_solve(bad0, y_simple), contains = "1-based")
-
-  cats_dbl <- matrix(c(1, 1, 2, 2, 1, 2, 1, 2), ncol = 2)
-  assert_true(withinr::within_solve(cats_dbl, y_simple)$converged, "Numeric categories coercion case failed.")
-
+  assert_error(withinr::within_solve(bad, y_simple), "NA")
+  assert_error(withinr::within_solve(-cats_2x2, y_simple), "non-negative")
   cats_fractional <- cats_dbl
   cats_fractional[1, 1] <- 1.5
-  assert_error(withinr::within_solve(cats_fractional, y_simple), contains = "finite integers")
+  assert_error(withinr::within_solve(cats_fractional, y_simple), "whole numbers")
+  assert_error(withinr::within_solve(list(1, 2), y_simple), "Effect() terms")
+  assert_error(withinr::within_solve(cats_2x2, y_simple[-1]), "length")
+  assert_error(withinr::within_solve(cats_2x2, "a"), "numeric vector")
 
-  # Varying slopes and effect-list designs
-  slope <- c(-1.0, 0.5, 1.5, 2.0)
-  effects <- list(
-    withinr::Effect(cats_2x2[, 1], slopes = slope),
-    withinr::Effect(cats_2x2[, 2])
-  )
-  effect_result <- withinr::within_solve(
-    effects,
-    y_simple,
-    preconditioner = withinr::PreconditionerConfig$Diagonal
-  )
-  assert_true(effect_result$converged, "Effect-list solve failed.")
-  assert_equal(length(effect_result$demeaned), length(y_simple), msg = "Effect-list demeaned length mismatch.")
-  effect_solver <- withinr::Solver(
-    effects,
-    preconditioner = withinr::PreconditionerConfig$Diagonal
-  )
-  assert_equal(
-    effect_solver$solve(y_simple)$demeaned,
-    effect_result$demeaned,
-    tol = 1e-6,
-    msg = "Persistent Effect-list solve mismatch."
-  )
+  # -------------------------------------------------------------------------
+  # Persistent Solver and Preconditioner reuse
+  # -------------------------------------------------------------------------
+  solver <- withinr::Solver(cats_2x2, preconditioner = P$Additive())
+  assert_true(inherits(solver, "within_solver"), "Solver() class mismatch.")
+  assert_equal(c(solver$n_obs, solver$n_dofs), c(4L, 4L), msg = "Solver sizes mismatch.")
+  assert_true(identical(solver$has_escalated, FALSE), "Additive solver reports escalation.")
+  assert_error(solver$n_obs <- 1L, "locked")
+  p <- solver$preconditioner
+  assert_true(inherits(p, "within_preconditioner"), "solver$preconditioner class mismatch.")
+  assert_true(grepl("Preconditioner(Additive, n=4)", printed(p), fixed = TRUE), "Preconditioner print.")
+  assert_equal(c(p$nrows, p$ncols), c(4L, 4L), msg = "Preconditioner shape mismatch.")
+  assert_equal(length(p$apply(rep(1, p$ncols))), p$nrows, msg = "Preconditioner apply length.")
+  assert_error(p$apply(1), "length")
+  assert_true(p$build_duration_seconds >= 0, "Negative build duration.")
+  assert_true(identical(p$config, P$Additive()), "Preconditioner config does not round-trip.")
+  assert_true(is.null(withinr::Solver(cats_2x2, preconditioner = "off")$preconditioner),
+              "Off solver has a preconditioner.")
+  assert_equal(withinr::Solver(cats_2x2, preconditioner = "diagonal")$preconditioner$variant, "Diagonal",
+               msg = "Diagonal preconditioner variant mismatch.")
 
-  # Larger deterministic design: preconditioner correctness and caller-order invariance
+  assert_equal(solver$solve(y_simple)$demeaned, s1$demeaned, tol = 1e-6, msg = "Persistent solve.")
+  assert_equal(solver$solve_batch(Y)$demeaned, b$demeaned, tol = 1e-6, msg = "Persistent batch.")
+  assert_error(solver$solve_batch(Y[-1, ]), "rows")
+
+  p2 <- withinr::Preconditioner(p$serialize())
+  assert_true(identical(p2$config, p$config), "Deserialized config mismatch.")
+  assert_equal(p2$build_duration_seconds, p$build_duration_seconds, msg = "Build duration not preserved.")
+  assert_equal(withinr::Solver(cats_2x2, preconditioner = p2)$solve(y_simple)$demeaned, s1$demeaned,
+               tol = 1e-6, msg = "Preconditioner reuse mismatch.")
+  assert_error(withinr::Preconditioner(as.raw(c(1, 2, 3))), "deserialize")
+  assert_error(withinr::Preconditioner("bytes"), "raw vector")
+
+  # -------------------------------------------------------------------------
+  # Larger fixture: preconditioners agree, caller order kept, base R oracle
+  # -------------------------------------------------------------------------
   set.seed(20260704)
   n <- 180L
-  cats <- cbind(
-    sample.int(29L, n, replace = TRUE),
-    sample.int(17L, n, replace = TRUE),
-    sample.int(11L, n, replace = TRUE)
-  )
+  cats <- cbind(sample.int(29L, n, TRUE), sample.int(17L, n, TRUE), sample.int(11L, n, TRUE))
   y <- rnorm(n)
-  y_alt <- 0.25 * y + rnorm(n)
-  Y_big <- cbind(y, y_alt)
+  Y_big <- cbind(y, y_alt = 0.25 * y + rnorm(n))
   weights <- runif(n, min = 0.5, max = 2.0)
   tight <- withinr::LsmrOptions(tol = 1e-10, maxiter = 4000L, local_size = 4L)
 
-  add_big <- withinr::within_solve(cats, y, options = tight, weights = weights)
-  diag_big <- withinr::within_solve(
-    cats,
-    y,
-    options = tight,
-    weights = weights,
-    preconditioner = withinr::PreconditionerConfig$Diagonal
-  )
-  off_big <- withinr::within_solve(
-    cats,
-    y,
-    options = tight,
-    weights = weights,
-    preconditioner = withinr::PreconditionerConfig$Off
-  )
-  assert_all_converged(add_big, "Additive preconditioner failed on larger design.")
-  assert_all_converged(diag_big, "Diagonal preconditioner failed on larger design.")
-  assert_all_converged(off_big, "Unpreconditioned solve failed on larger design.")
-  assert_equal(
-    diag_big$demeaned,
-    add_big$demeaned,
-    tol = 1e-6,
-    msg = "Diagonal and additive demeaned outputs disagree."
-  )
-  assert_equal(
-    off_big$demeaned,
-    add_big$demeaned,
-    tol = 1e-6,
-    msg = "Unpreconditioned and additive demeaned outputs disagree."
-  )
+  fits <- lapply(list(P$Adaptive(), P$Additive(), P$Diagonal(), P$Off()), function(precond) {
+    withinr::within_solve(cats, y, weights, tight, precond)
+  })
+  for (fit in fits) {
+    assert_true(fit$converged, "A preconditioner failed on the larger design.")
+    assert_equal(fit$demeaned, fits[[1]]$demeaned, tol = 1e-6, msg = "Preconditioners disagree.")
+  }
 
-  solver_big <- withinr::Solver(cats, weights = weights)
-  pre_big <- solver_big$preconditioner()
-  reuse_big <- withinr::within_solve(cats, y, options = tight, weights = weights, preconditioner = pre_big)
-  assert_equal(reuse_big$demeaned, add_big$demeaned, tol = 1e-6, msg = "One-shot preconditioner reuse mismatch.")
-
-  batch_reuse <- withinr::within_solve_batch(cats, Y_big, options = tight, weights = weights, preconditioner = pre_big)
-  batch_fresh <- withinr::within_solve_batch(cats, Y_big, options = tight, weights = weights)
-  assert_all_converged(batch_reuse, "Prebuilt batch solve failed on larger design.")
-  assert_equal(
-    batch_reuse$demeaned,
-    batch_fresh$demeaned,
-    tol = 1e-6,
-    msg = "Batch preconditioner reuse mismatch."
-  )
-
-  order_dominant <- order(cats[, 1], cats[, 2], cats[, 3])
-  sorted <- withinr::within_solve(
-    cats[order_dominant, , drop = FALSE],
-    y[order_dominant],
-    options = tight,
-    weights = weights[order_dominant]
-  )
-  assert_equal(
-    add_big$demeaned[order_dominant],
-    sorted$demeaned,
-    tol = 1e-6,
-    msg = "Unsorted input did not return demeaned values in caller order."
-  )
-
-  sorted_batch <- withinr::within_solve_batch(
-    cats[order_dominant, , drop = FALSE],
-    Y_big[order_dominant, , drop = FALSE],
-    options = tight,
-    weights = weights[order_dominant]
-  )
-  assert_equal(
-    batch_fresh$demeaned[order_dominant, , drop = FALSE],
-    sorted_batch$demeaned,
-    tol = 1e-6,
-    msg = "Unsorted batch input did not return demeaned values in caller order."
-  )
-
-  # Independent weighted least-squares oracle (including rank-deficient dummies).
-  D <- do.call(cbind, lapply(seq_len(ncol(cats)), function(j) {
-    model.matrix(~ factor(cats[, j]) - 1)
-  }))
+  D <- do.call(cbind, lapply(seq_len(ncol(cats)), function(j) model.matrix(~ factor(cats[, j]) - 1)))
   oracle <- lm.wfit(D, Y_big, w = weights)$residuals
-  assert_equal(batch_fresh$demeaned, oracle, tol = 1e-7,
-               msg = "Weighted demeaning differs from base R least squares.")
+  batch_fresh <- withinr::within_solve_batch(cats, Y_big, weights, tight)
+  assert_equal(batch_fresh$demeaned, oracle, tol = 1e-7, msg = "Weighted demeaning != lm.wfit.")
 
-  # Native designs own their inputs, preserve gappy caller labels, and may be
-  # reused with different weights and with a persistent solver.
+  pre_big <- withinr::Solver(cats, weights = weights, preconditioner = "additive")$preconditioner
+  reuse <- withinr::within_solve_batch(cats, Y_big, weights, tight, preconditioner = pre_big)
+  assert_equal(reuse$demeaned, oracle, tol = 1e-7, msg = "Batch preconditioner reuse mismatch.")
+
+  ord <- order(cats[, 1], cats[, 2], cats[, 3])
+  sorted <- withinr::within_solve_batch(cats[ord, ], Y_big[ord, ], weights[ord], tight)
+  assert_equal(batch_fresh$demeaned[ord, ], sorted$demeaned, tol = 1e-6,
+               msg = "Unsorted input did not return results in caller order.")
+
+  # Designs own their inputs, keep gappy caller labels, and are reusable.
   gappy <- cats * 100L
   design <- withinr::Design(gappy)
-  gappy[,] <- 1L
-  gc()
-  reused_design <- withinr::within_solve_batch(design, Y_big, weights = weights, options = tight)
-  assert_equal(reused_design$demeaned, oracle, tol = 1e-7)
-  assert_equal(reused_design$layout$address(1L)$level, 100L)
-  assert_equal(reused_design$layout$index(1L, 100L, 1L), 1L)
-  assert_error(reused_design$layout$index(1L, 1L, 1L), "out of range")
-  assert_equal(withinr::Solver(design)$solve(y, tight)$demeaned,
-               lm.fit(D, y)$residuals, tol = 1e-7)
+  assert_true(inherits(design, "within_design"), "Design() class mismatch.")
+  assert_equal(c(design$n_obs, design$n_dofs), c(n, ncol(D)), msg = "Design sizes.")
+  assert_true(identical(withinr::Design(design), design), "Design(Design) is not a pass-through.")
+  gappy[, ] <- 1L
+  invisible(gc())
+  reused <- withinr::within_solve_batch(design, Y_big, weights, tight)
+  assert_equal(reused$demeaned, oracle, tol = 1e-7, msg = "Persistent design mismatch.")
+  assert_equal(reused$layout$address(1)$level, 100L, msg = "Gappy labels not preserved.")
+  assert_equal(reused$layout$index(1, 100, 1), 1L, msg = "Gappy label index mismatch.")
+  assert_error(reused$layout$index(1, 1, 1), "out of range")
+  assert_equal(withinr::Solver(design)$solve(y, tight)$demeaned, lm.fit(D, y)$residuals, tol = 1e-7,
+               msg = "Solver on a persistent design mismatch.")
 
-  # Adaptive starts with diagonal scaling; force a stall on this nontrivial
-  # fixture to exercise the deferred native build through the R boundary.
+  # Adaptive: force a stall to exercise the deferred native Schwarz build.
   adaptive <- withinr::Solver(design, weights = weights,
-                              preconditioner = withinr::Adaptive(window = 1L, threshold = 0))
-  assert_true(!adaptive$has_escalated(), "Adaptive built Schwarz eagerly.")
-  assert_equal(adaptive$preconditioner()$config$variant, "Diagonal")
+                              preconditioner = P$Adaptive(stall = withinr::Staleness(1, 0)))
+  assert_true(!adaptive$has_escalated, "Adaptive built Schwarz eagerly.")
+  assert_equal(adaptive$preconditioner$config$variant, "Adaptive", msg = "Ladder base config mismatch.")
   adaptive_result <- adaptive$solve(y, tight)
   assert_true(adaptive_result$converged, "Adaptive failed to converge.")
-  assert_true(adaptive$has_escalated(), "Forced adaptive escalation did not occur.")
-  assert_equal(adaptive_result$demeaned, oracle[, 1], tol = 1e-7)
-  assert_equal(adaptive$preconditioner()$config$variant, "Additive")
-  assert_equal(withinr::Solver(cats_2x2)$preconditioner()$config$variant, "Diagonal")
+  assert_true(adaptive$has_escalated, "Forced adaptive escalation did not occur.")
+  assert_equal(adaptive_result$demeaned, oracle[, 1], tol = 1e-7, msg = "Adaptive result mismatch.")
+  assert_equal(adaptive$preconditioner$variant, "Additive", msg = "Escalated map is not Additive.")
 
-  # Varying slopes checked against an independently constructed dummy design.
+  # -------------------------------------------------------------------------
+  # Varying slopes, checked against independently built dummy designs
+  # -------------------------------------------------------------------------
   z <- rnorm(n)
-  slope_design <- list(withinr::Effect(cats[, 1], slopes = z),
-                       withinr::Effect(cats[, 2]))
+  z2 <- rnorm(n)
   D1 <- model.matrix(~ factor(cats[, 1]) - 1)
   D2 <- model.matrix(~ factor(cats[, 2]) - 1)
-  slope_oracle <- lm.wfit(cbind(D1, D1 * z, D2), Y_big, weights)$residuals
-  slope_result <- withinr::within_solve_batch(slope_design, Y_big, weights = weights, options = tight)
-  assert_all_converged(slope_result, "Varying slopes failed to converge.")
-  assert_equal(slope_result$demeaned, slope_oracle, tol = 1e-7)
 
-  assert_error(withinr::Solver(cats, preconditioner = withinr::Adaptive(window = 0)), "positive")
-  assert_error(withinr::Solver(cats, preconditioner = withinr::Adaptive(threshold = 1)), "threshold")
-  assert_error(withinr::within_solve(cats, y[-1]), "length")
-  assert_error(withinr::within_solve(cats, replace(y, 1, NA_real_)))
-  assert_error(withinr::within_solve(cats, y, weights = rep(-1, n)))
-  assert_error(withinr::Preconditioner(as.raw(c(1, 2, 3))))
+  slope_design <- list(withinr::Effect(cats[, 1], slopes = z), withinr::Effect(cats[, 2]))
+  slope_oracle <- lm.wfit(cbind(D1, D1 * z, D2), Y_big, weights)$residuals
+  slope_result <- withinr::within_solve_batch(slope_design, Y_big, weights, tight)
+  assert_true(all(slope_result$converged), "Varying slopes failed to converge.")
+  assert_equal(slope_result$demeaned, slope_oracle, tol = 1e-7, msg = "Varying slopes != lm.wfit.")
+  assert_equal(slope_result$layout$n_columns(1), 2L, msg = "Slope term column count mismatch.")
+  slope_solver <- withinr::Solver(slope_design, weights = weights)
+  assert_equal(slope_solver$solve_batch(Y_big, tight)$demeaned, slope_oracle, tol = 1e-7,
+               msg = "Persistent varying-slope solve mismatch.")
+
+  # Two slopes from a matrix, and a slopes-only term (no intercept).
+  multi <- list(withinr::Effect(cats[, 1], slopes = cbind(z, z2)),
+                withinr::Effect(cats[, 2], intercept = FALSE, slopes = list(z2)),
+                withinr::Effect(cats[, 3]))
+  D3 <- model.matrix(~ factor(cats[, 3]) - 1)
+  multi_oracle <- lm.fit(cbind(D1, D1 * z, D1 * z2, D2 * z2, D3), y)$residuals
+  multi_fit <- withinr::within_solve(multi, y, options = tight)
+  assert_true(multi_fit$converged, "Multi-slope design failed to converge.")
+  assert_equal(multi_fit$demeaned, multi_oracle, tol = 1e-7, msg = "Multi-slope design != lm.fit.")
+  assert_equal(sapply(1:3, multi_fit$layout$n_columns), c(3L, 1L, 1L), msg = "Multi-slope layout.")
+  assert_equal(withinr::within_solve(withinr::Design(multi), y, options = tight)$demeaned, multi_oracle,
+               tol = 1e-7, msg = "Design(list of Effect) mismatch.")
+
+  # A level whose slope covariate is identically zero is unidentified; its slot is 0.
+  lv <- c(1, 1, 2, 2, 3, 3)
+  zero_slope <- withinr::within_solve(list(withinr::Effect(lv, FALSE, c(0, 0, 1, 2, 3, 1))),
+                                      c(1, 2, 3, 4, 5, 7))
+  assert_equal(zero_slope$unidentified, data.frame(term = 1L, level = 1L, column = 1L),
+               msg = "Unidentified direction not reported.")
+  assert_equal(zero_slope$x[zero_slope$layout$index(1, 1, 1)], 0, msg = "Unidentified slot not 0.")
+
+  assert_error(withinr::Effect(lv, slopes = 1:3), "one value per observation")
+  assert_error(withinr::Effect(lv, intercept = FALSE), "intercept or at least one slope")
+  assert_error(withinr::Effect(lv, slopes = c(1, 2, NA, 4, 5, 6)), "finite")
+  assert_error(withinr::Effect(lv, intercept = NA), "TRUE or FALSE")
+
+  # Native handles do not survive serialization.
   restored <- unserialize(serialize(design, NULL))
   assert_error(withinr::Solver(restored))
 

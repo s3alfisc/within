@@ -1,13 +1,14 @@
-//! Shared R ↔ Rust coercion helpers and error plumbing for the bridge.
+//! Shared R ↔ Rust coercion helpers, error plumbing, and design extraction.
 //!
-//! R users pass **1-based** integer factor labels. This module validates that
-//! all entries are positive and contain no `NA`, then subtracts 1 to produce
-//! the caller labels used by the Rust solver.
+//! Mirrors `crates/within-py/src/convert.rs` plus the design extraction from
+//! `crates/within-py/src/api.rs`. Factor labels pass through unchanged: an R
+//! label `7` is native label `7`, so coefficient addresses report the labels
+//! the caller supplied. Term, column, and `x` indices are 1-based in R.
 
-use extendr_api::{error::Result, prelude::*};
+use extendr_api::{error::Result, prelude::*, AsTypedSlice};
 use ndarray::{ArrayView2, ShapeBuilder};
 
-use within::{Design, Effect, IntoDesign};
+use within::{Design, Effect};
 
 pub(crate) fn err(message: impl Into<String>) -> Error {
     Error::Other(message.into())
@@ -15,10 +16,9 @@ pub(crate) fn err(message: impl Into<String>) -> Error {
 
 /// Raise `Err` as an R error, preserving its message.
 ///
-/// extendr's default handling of `Result` return values unwraps them (a
-/// panic), which surfaces in R as a generic "User function panicked" message.
-/// Every `#[extendr]` entry point therefore wraps its fallible body in a
-/// `?`-friendly closure and funnels the outcome through this helper instead.
+/// extendr's default handling of `Result` return values panics, which surfaces
+/// in R as a generic "User function panicked" message. Every `#[extendr]`
+/// entry point therefore funnels its fallible body through this helper.
 pub(crate) fn or_throw<T>(result: Result<T>) -> T {
     match result {
         Ok(value) => value,
@@ -27,209 +27,265 @@ pub(crate) fn or_throw<T>(result: Result<T>) -> T {
 }
 
 pub(crate) fn usize_to_i32(value: usize, name: &str) -> Result<i32> {
-    i32::try_from(value).map_err(|_| err(format!("{name} exceeds i32 range")))
+    i32::try_from(value).map_err(|_| err(format!("{name} exceeds R's integer range")))
 }
 
-pub(crate) fn parse_positive_f64(field: &Robj, name: &str) -> Result<f64> {
-    let value = if let Some(value) = field.as_real() {
-        value
-    } else if let Some(value) = field.as_integer() {
-        value as f64
-    } else {
-        return Err(err(format!("{name} must be a positive finite number")));
-    };
-
-    if !value.is_finite() || value <= 0.0 {
-        return Err(err(format!("{name} must be a positive finite number")));
-    }
-    Ok(value)
+/// 0-based native position → 1-based R index.
+pub(crate) fn one_based(value: usize, name: &str) -> Result<i32> {
+    usize_to_i32(value, name)?
+        .checked_add(1)
+        .ok_or_else(|| err(format!("{name} exceeds R's integer range")))
 }
 
-pub(crate) fn parse_nonnegative_f64(field: &Robj, name: &str) -> Result<f64> {
-    let value = if let Some(value) = field.as_real() {
-        value
-    } else if let Some(value) = field.as_integer() {
-        value as f64
-    } else {
-        return Err(err(format!("{name} must be a non-negative finite number")));
-    };
-
-    if !value.is_finite() || value < 0.0 {
-        return Err(err(format!("{name} must be a non-negative finite number")));
-    }
-    Ok(value)
-}
-
-pub(crate) fn parse_nonnegative_integer(field: &Robj, name: &str) -> Result<i64> {
-    let value = if let Some(value) = field.as_integer() {
-        value as f64
-    } else if let Some(value) = field.as_real() {
-        value
-    } else {
-        return Err(err(format!("{name} must be numeric")));
-    };
-
-    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 {
-        return Err(err(format!("{name} must be a non-negative integer")));
-    }
-    Ok(value as i64)
-}
-
-pub(crate) fn parse_positive_u32(field: &Robj, name: &str) -> Result<u32> {
-    let value = parse_nonnegative_integer(field, name)?;
-    if value < 1 || value > u32::MAX as i64 {
-        return Err(err(format!("{name} must be in 1..={}", u32::MAX)));
-    }
-    Ok(value as u32)
-}
-
-pub(crate) fn parse_optional_u32(field: &Robj, name: &str) -> Result<Option<u32>> {
-    if field.is_null() {
-        return Ok(None);
-    }
-    Ok(Some(parse_positive_u32(field, name)?))
-}
-
-pub(crate) fn get_field_or_null(obj: &Robj, field: &str) -> Robj {
+pub(crate) fn get_field(obj: &Robj, field: &str) -> Robj {
     obj.dollar(field).unwrap_or_else(|_| nil_value())
 }
 
-/// Borrowed weights for the one-shot paths (`NULL` → `None`), avoiding a copy.
-pub(crate) fn weights_slice(weights: &Robj) -> Result<Option<&[f64]>> {
-    if weights.is_null() {
-        return Ok(None);
-    }
-    weights
-        .as_real_slice()
-        .map(Some)
-        .ok_or_else(|| err("weights must be a numeric vector or NULL"))
-}
+// ---------------------------------------------------------------------------
+// Scalars
+// ---------------------------------------------------------------------------
 
-/// Convert an R integer matrix (1-based, column-major) to a 0-based `u32`
-/// buffer preserving R's column-major layout.
-pub(crate) fn cast_categories(data: &[i32]) -> Result<Vec<u32>> {
-    let mut out = Vec::with_capacity(data.len());
-    for (pos, &value) in data.iter().enumerate() {
-        if value == i32::MIN {
-            return Err(err(format!(
-                "categories must not contain NA values (found at position {})",
-                pos + 1
-            )));
+/// A length-one, non-missing integer or double.
+pub(crate) fn scalar_f64(obj: &Robj, name: &str) -> Result<f64> {
+    if let Some(&[value]) = obj.as_integer_slice() {
+        if value != i32::MIN {
+            return Ok(f64::from(value));
         }
-        if value < 1 {
-            return Err(err(format!(
-                "categories must be >= 1 (1-based); found {value} at position {}",
-                pos + 1
-            )));
+    } else if let Some(&[value]) = obj.as_real_slice() {
+        if !value.is_nan() {
+            return Ok(value);
         }
-        out.push((value - 1) as u32);
     }
-    Ok(out)
+    Err(err(format!("`{name}` must be a single non-missing number")))
 }
 
-pub(crate) fn categories_view<'a>(
-    categories: &RMatrix<i32>,
-    cats_u32: &'a [u32],
-) -> Result<ArrayView2<'a, u32>> {
-    ArrayView2::from_shape((categories.nrows(), categories.ncols()).f(), cats_u32)
-        .map_err(|e| err(e.to_string()))
+/// A whole number in `[min, max]`.
+fn scalar_whole(obj: &Robj, name: &str, min: f64, max: f64) -> Result<f64> {
+    let value = scalar_f64(obj, name)?;
+    if !value.is_finite() || value.fract() != 0.0 || value < min || value > max {
+        return Err(err(format!(
+            "`{name}` must be a whole number in [{min}, {max}]"
+        )));
+    }
+    Ok(value)
 }
 
-fn categories_design(categories: &RMatrix<i32>) -> Result<Design<'static>> {
-    let cats_u32 = cast_categories(categories.data())?;
-    let cats = categories_view(categories, &cats_u32)?;
-    crate::threads::run(|| cats.into_design().map(Design::into_owned))?
-        .map_err(|e| err(e.to_string()))
+pub(crate) fn scalar_usize(obj: &Robj, name: &str, min: usize) -> Result<usize> {
+    // Keep within R's integer range so the value round-trips back to R exactly.
+    scalar_whole(obj, name, min as f64, f64::from(i32::MAX)).map(|v| v as usize)
 }
 
-struct OwnedEffect {
+pub(crate) fn scalar_u32(obj: &Robj, name: &str, min: u32) -> Result<u32> {
+    scalar_whole(obj, name, f64::from(min), f64::from(i32::MAX)).map(|v| v as u32)
+}
+
+/// Seeds are doubles in R; every integer up to 2^53 is exact.
+pub(crate) fn scalar_u64(obj: &Robj, name: &str) -> Result<u64> {
+    scalar_whole(obj, name, 0.0, 9_007_199_254_740_992.0).map(|v| v as u64)
+}
+
+pub(crate) fn optional<T>(obj: &Robj, parse: impl FnOnce(&Robj) -> Result<T>) -> Result<Option<T>> {
+    if obj.is_null() {
+        Ok(None)
+    } else {
+        parse(obj).map(Some)
+    }
+}
+
+pub(crate) fn scalar_bool(obj: &Robj, name: &str) -> Result<bool> {
+    obj.as_bool()
+        .ok_or_else(|| err(format!("`{name}` must be TRUE or FALSE")))
+}
+
+// ---------------------------------------------------------------------------
+// Vectors
+// ---------------------------------------------------------------------------
+
+/// Borrow a double vector (the R wrappers coerce before calling).
+///
+/// The slice lives as long as the R vector, which the calling R frame keeps
+/// alive for the whole `.Call`, so it may outlive this (temporary) `Robj`
+/// handle — the same contract as extendr's `as_integer_slice`.
+pub(crate) fn real_slice<'a>(obj: &Robj, name: &str) -> Result<&'a [f64]> {
+    if obj.rtype() != Rtype::Doubles {
+        return Err(err(format!("`{name}` must be a double vector")));
+    }
+    <Robj as AsTypedSlice<'a, f64>>::as_typed_slice(obj)
+        .ok_or_else(|| err(format!("`{name}` must be a double vector")))
+}
+
+/// Validated non-negative factor labels, copied to the native `u32` layout.
+pub(crate) fn labels_to_u32(data: &[i32], name: &str) -> Result<Vec<u32>> {
+    data.iter()
+        .enumerate()
+        .map(|(pos, &value)| {
+            if value == i32::MIN {
+                Err(err(format!(
+                    "`{name}` must not contain NA (found at position {})",
+                    pos + 1
+                )))
+            } else if value < 0 {
+                Err(err(format!(
+                    "`{name}` labels must be non-negative; found {value} at position {}",
+                    pos + 1
+                )))
+            } else {
+                Ok(value as u32)
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn optional_weights<'a>(weights: &Robj) -> Result<Option<&'a [f64]>> {
+    optional(weights, |w| real_slice(w, "weights"))
+}
+
+/// `(nrow, ncol)` of a two-dimensional R array.
+fn matrix_dims(obj: &Robj) -> Option<(usize, usize)> {
+    match obj.get_attrib("dim")?.as_integer_slice()? {
+        &[nrow, ncol] if nrow >= 0 && ncol >= 0 => Some((nrow as usize, ncol as usize)),
+        _ => None,
+    }
+}
+
+/// Borrow the columns of a column-major double matrix; R columns are always contiguous.
+pub(crate) fn matrix_columns<'a>(matrix: &Robj, name: &str) -> Result<(usize, Vec<&'a [f64]>)> {
+    let data = real_slice(matrix, name)?;
+    let (nrow, ncol) =
+        matrix_dims(matrix).ok_or_else(|| err(format!("`{name}` must be a matrix")))?;
+    let columns = (0..ncol).map(|j| &data[j * nrow..(j + 1) * nrow]).collect();
+    Ok((nrow, columns))
+}
+
+// ---------------------------------------------------------------------------
+// Designs
+// ---------------------------------------------------------------------------
+
+/// Native columns behind one R `Effect()`: labels are converted, slopes borrowed.
+pub(crate) struct EffectColumns<'a> {
     levels: Vec<u32>,
     intercept: bool,
-    slopes: Vec<Vec<f64>>,
+    slopes: Vec<&'a [f64]>,
 }
 
-fn parse_effect(obj: Robj, term: usize) -> Result<OwnedEffect> {
+/// Native categories matrix, converted from R's 1-column-per-factor integers.
+pub(crate) struct Categories {
+    labels: Vec<u32>,
+    nrow: usize,
+    ncol: usize,
+}
+
+impl Categories {
+    pub(crate) fn view(&self) -> Result<ArrayView2<'_, u32>> {
+        ArrayView2::from_shape((self.nrow, self.ncol).f(), &self.labels)
+            .map_err(|e| err(e.to_string()))
+    }
+
+    pub(crate) fn nrow(&self) -> usize {
+        self.nrow
+    }
+}
+
+/// A persistent, categorical, or effect-based design supplied from R.
+pub(crate) enum DesignSource<'a> {
+    /// A cheap clone of an existing persistent `Design()` handle.
+    Persistent(Design<'static>),
+    Categories(Categories),
+    Effects(Vec<EffectColumns<'a>>),
+}
+
+impl<'a> DesignSource<'a> {
+    pub(crate) fn effects<'c>(columns: &'c [EffectColumns<'a>]) -> Result<Vec<Effect<'c>>> {
+        columns
+            .iter()
+            .map(|c| Effect::new(&c.levels, c.intercept, c.slopes.iter().copied()))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| err(e.to_string()))
+    }
+
+    /// Observation count, read without building the design.
+    pub(crate) fn n_obs(&self) -> Option<usize> {
+        match self {
+            Self::Persistent(design) => Some(design.n_obs()),
+            Self::Categories(categories) => Some(categories.nrow()),
+            Self::Effects(columns) => columns.first().map(|c| c.levels.len()),
+        }
+    }
+
+    /// Build an owned native design (for `Design()` and `Solver()`).
+    pub(crate) fn into_owned(self) -> Result<Design<'static>> {
+        match self {
+            Self::Persistent(design) => Ok(design),
+            Self::Categories(categories) => {
+                let view = categories.view()?;
+                crate::threads::run(|| Design::from_categories(view).map(Design::into_owned))?
+                    .map_err(|e| err(e.to_string()))
+            }
+            Self::Effects(columns) => {
+                let effects = Self::effects(&columns)?;
+                crate::threads::run(|| Design::new(effects).map(Design::into_owned))?
+                    .map_err(|e| err(e.to_string()))
+            }
+        }
+    }
+}
+
+fn parse_effect<'a>(obj: &Robj, term: usize) -> Result<EffectColumns<'a>> {
     if !obj.inherits("within_effect") {
         return Err(err(format!(
-            "design term {} must be created by Effect(...)",
+            "design term {} must be created by Effect()",
             term + 1
         )));
     }
-
-    let levels_obj = get_field_or_null(&obj, "levels");
-    let levels = levels_obj
+    let levels = get_field(obj, "levels");
+    let levels = levels
         .as_integer_slice()
         .ok_or_else(|| err(format!("design term {} levels must be integer", term + 1)))?;
-    let levels = cast_categories(levels)?;
-
-    let intercept = get_field_or_null(&obj, "intercept")
-        .as_bool()
-        .ok_or_else(|| {
-            err(format!(
-                "design term {} intercept must be TRUE or FALSE",
-                term + 1
-            ))
-        })?;
-
-    let slopes_obj = get_field_or_null(&obj, "slopes");
-    let slopes_list = slopes_obj
+    let levels = labels_to_u32(levels, &format!("Effect {} levels", term + 1))?;
+    let intercept = scalar_bool(&get_field(obj, "intercept"), "intercept")?;
+    let slopes = get_field(obj, "slopes");
+    let slopes = slopes
         .as_list()
-        .ok_or_else(|| err(format!("design term {} slopes must be a list", term + 1)))?;
-    let slopes = slopes_list
+        .ok_or_else(|| err(format!("design term {} slopes must be a list", term + 1)))?
         .values()
         .enumerate()
         .map(|(slope, value)| {
-            value.as_real_vector().ok_or_else(|| {
-                err(format!(
-                    "design term {} slope {} must be numeric",
-                    term + 1,
-                    slope + 1
-                ))
-            })
+            real_slice(&value, &format!("Effect {} slope {}", term + 1, slope + 1))
         })
         .collect::<Result<Vec<_>>>()?;
-
-    Ok(OwnedEffect {
+    Ok(EffectColumns {
         levels,
         intercept,
         slopes,
     })
 }
 
-/// Parse an R category matrix or list of `Effect()` terms into an owned native
-/// design. Owning the columns keeps persistent solver handles independent of
-/// the lifetime and mutability of their originating R objects.
-pub(crate) fn parse_design(design: &Robj) -> Result<Design<'static>> {
+/// Parse a `Design()` handle, an integer category matrix, or a list of `Effect()`s.
+pub(crate) fn parse_design<'a>(design: &Robj) -> Result<DesignSource<'a>> {
     if design.inherits("within_design") {
-        let ptr = ExternalPtr::<Design<'static>>::try_from(get_field_or_null(design, "ptr"))?;
-        return Ok(ptr.try_addr()?.clone());
+        let ptr = ExternalPtr::<Design<'static>>::try_from(get_field(design, "ptr"))
+            .map_err(|_| err("`design` holds an invalid Design() handle"))?;
+        return Ok(DesignSource::Persistent(ptr.try_addr()?.clone()));
     }
     if design.is_matrix() {
-        let categories = RMatrix::<i32>::try_from(design)
-            .map_err(|_| err("design matrices must contain integer factor labels"))?;
-        return categories_design(&categories);
+        let data = design
+            .as_integer_slice()
+            .ok_or_else(|| err("a design matrix must hold integer factor labels"))?;
+        let (nrow, ncol) =
+            matrix_dims(design).ok_or_else(|| err("a design matrix must be two-dimensional"))?;
+        return Ok(DesignSource::Categories(Categories {
+            labels: labels_to_u32(data, "design")?,
+            nrow,
+            ncol,
+        }));
     }
-
-    let terms = design
-        .as_list()
-        .ok_or_else(|| err("design must be an integer matrix or a list of Effect() terms"))?;
-    let owned = terms
+    let terms = design.as_list().ok_or_else(|| {
+        err("`design` must be a Design(), an integer matrix, or a list of Effect()")
+    })?;
+    let columns = terms
         .values()
         .enumerate()
-        .map(|(term, obj)| parse_effect(obj, term))
+        .map(|(term, obj)| parse_effect(&obj, term))
         .collect::<Result<Vec<_>>>()?;
-    let effects = owned
-        .iter()
-        .map(|effect| {
-            Effect::new(
-                &effect.levels,
-                effect.intercept,
-                effect.slopes.iter().map(Vec::as_slice),
-            )
-        })
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| err(e.to_string()))?;
-
-    crate::threads::run(|| Design::new(effects).map(Design::into_owned))?
-        .map_err(|e| err(e.to_string()))
+    Ok(DesignSource::Effects(columns))
 }

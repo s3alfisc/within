@@ -20,4 +20,4 @@ SystemRequirements: Cargo (Rust's package manager), rustc (>= 1.85)
 URL: https://github.com/py-econometrics/within
 BugReports: https://github.com/py-econometrics/within/issues
 Config/rextendr/version: 0.5.0
-Config/roxygen2/version: 8.1.0
+Config/roxygen2/version: 8.1.1

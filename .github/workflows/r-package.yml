@@ -42,20 +42,17 @@ jobs:
         run: brew install checkbashisms
       - name: Install generation tools
         shell: Rscript {0}
-        run: install.packages(c("rextendr", "usethis", "roxygen2", "pkgload"))
-      - name: Regenerate glue from scratch and vendor dependencies
+        run: install.packages(c("rextendr", "usethis", "roxygen2", "pkgload", "jsonlite", "processx"))
+      - name: Generate glue and vendor dependencies
+        shell: bash
+        run: Rscript scripts/prepare-r-package.R --vendor
+      - name: Check that generation leaves tracked files untouched
+        shell: bash
+        # roxygen stamps its own version into DESCRIPTION, so that file is exempt.
+        run: git diff --exit-code -- . ':!withinr/DESCRIPTION'
+      - name: Lint the Rust adapter
         shell: bash
         run: |
-          rm -f withinr/R/extendr-wrappers.R withinr/NAMESPACE
-          rm -f withinr/src/entrypoint.c withinr/src/rust/document.rs
-          rm -f withinr/src/Makevars.in withinr/src/Makevars.win.in withinr/src/withinr-win.def
-          rm -f withinr/configure withinr/configure.win withinr/cleanup withinr/cleanup.win
-          rm -rf withinr/tools withinr/man
-          Rscript scripts/prepare-r-package.R --vendor
-      - name: Check generated bindings and Rust adapter
-        shell: bash
-        run: |
-          git diff --exit-code -- withinr/R/extendr-wrappers.R withinr/src/entrypoint.c withinr/src/rust/document.rs
           cargo fmt --manifest-path withinr/src/rust/Cargo.toml -- --check
           cargo clippy --locked --manifest-path withinr/src/rust/Cargo.toml -- -D warnings
       - name: Build source package

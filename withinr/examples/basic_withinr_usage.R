@@ -23,8 +23,8 @@ firm <- sample.int(n_firm, n, replace = TRUE)
 worker <- sample.int(n_worker, n, replace = TRUE)
 year <- sample.int(n_year, n, replace = TRUE)
 
-# withinr expects a 1-based integer matrix: rows are observations, columns are
-# fixed-effect dimensions.
+# A design is a matrix (or data frame) of factor labels: rows are observations,
+# columns are fixed-effect dimensions. Factor/character columns use their codes.
 categories <- cbind(firm = firm, worker = worker, year = year)
 
 x1 <- rnorm(n)
@@ -52,7 +52,7 @@ fit_y <- withinr::within_solve(
   y,
   options = options,
   weights = weights,
-  preconditioner = withinr::PreconditionerConfig$Additive
+  preconditioner = withinr::PreconditionerConfig$Additive()
 )
 
 cat("Single RHS converged:", fit_y$converged, "\n")
@@ -65,7 +65,7 @@ batch <- withinr::within_solve_batch(
   cbind(y = y, X),
   options = options,
   weights = weights,
-  preconditioner = withinr::PreconditionerConfig$Additive
+  preconditioner = withinr::PreconditionerConfig$Additive()
 )
 
 y_tilde <- batch$demeaned[, 1]
@@ -78,7 +78,7 @@ cat("\n")
 
 # 3. Persistent solver: build the design/preconditioner once and reuse it.
 solver <- withinr::Solver(categories, weights = weights)
-preconditioner <- solver$preconditioner()
+preconditioner <- solver$preconditioner
 print(preconditioner)
 
 again <- solver$solve(y, options = options)
@@ -93,3 +93,16 @@ stopifnot(isTRUE(all.equal(reused$demeaned, fit_y$demeaned, tolerance = 1e-6)))
 
 cat("Serialized preconditioner bytes:", length(payload), "\n")
 cat("Reuse check: OK\n")
+
+# 5. Varying slopes: a firm-specific slope on tenure on top of firm, worker,
+#    and year intercepts. Effect() terms mirror Python's within.Effect.
+tenure <- rpois(n, 5) + rnorm(n, sd = 0.1)
+slopes <- list(
+  withinr::Effect(firm, intercept = TRUE, slopes = tenure),
+  withinr::Effect(worker),
+  withinr::Effect(year)
+)
+fit_slopes <- withinr::within_solve(slopes, y, weights = weights, options = options)
+print(fit_slopes)
+layout <- fit_slopes$layout
+cat("Firm 1 tenure slope:", fit_slopes$x[layout$index(term = 1, level = 1, column = 2)], "\n")

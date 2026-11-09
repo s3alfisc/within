@@ -1,17 +1,14 @@
 ## Local validation
 
-Tested on macOS arm64, R 4.5.3, Rust/cargo 1.93.1:
+Tested on macOS arm64, R 4.6.1, Rust/cargo 1.93.1, after generating all glue
+from scratch with `Rscript scripts/prepare-r-package.R --vendor`:
 
 `CARGO_NET_OFFLINE=true R CMD check --as-cran --no-manual withinr_0.1.0.tar.gz`
 
-0 errors, 0 warnings, 2 notes:
-
-* Unable to verify current time in the network-restricted test environment.
-* `xcrun_db` left in the test temporary directory by the macOS SDK tooling.
-
-Installation, loading/unloading, documentation, examples, and all tests passed.
-The numerical tests compare weighted and varying-slope residuals with base R
-least squares. Rust formatting and clippy checks also passed.
+0 errors, 1 warning, 0 notes. The warning is environmental: `checkbashisms`
+was not installed on the test machine. Installation, documentation, examples,
+and all tests passed. The numerical tests compare weighted and varying-slope
+residuals with base R least squares. Rust formatting and clippy checks passed.
 
 The repository CI is configured for Linux, macOS, and Windows, plus Rust 1.85
 on Linux. Those remote jobs have not been run as part of this local validation.

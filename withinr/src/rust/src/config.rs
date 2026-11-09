@@ -1,337 +1,384 @@
-//! R config objects → native [`within::config`] conversions, plus the
-//! built-preconditioner handle exposed to R.
+//! R config objects ↔ native [`within::config`] conversions, plus the built
+//! preconditioner handle.
 //!
-//! Mirrors `crates/within-py/src/config.rs`: this is where R-facing
-//! configuration values (classed lists, shortcut strings) are parsed into
-//! native `within` config types.
+//! Mirrors `crates/within-py/src/config.rs`. Each R constructor
+//! (`LsmrOptions()`, `LocalSolverConfig()`, `PreconditionerConfig$Adaptive()`,
+//! ...) round-trips its arguments through [`config_normalize_impl`]: the
+//! arguments are parsed into the native type — so validation and defaults live
+//! only in the core — and converted back into a fully resolved, classed R
+//! list. `Preconditioner$config` uses the same conversion, so two equal
+//! configurations are `identical()` in R just as they compare equal in Python.
 
 use extendr_api::{error::Result, prelude::*};
 
 use within::config::{
     ApproxCholConfig, ApproxSchurConfig, LocalSolverConfig, LsmrOptions, PreconditionerConfig,
-    ReductionStrategy, ScalingConfig, ScalingFailure, SchurMode, Staleness,
+    ScalingConfig, ScalingFailure, SchurMode, Staleness,
 };
-use within::Preconditioner;
+use within::{Preconditioner, PreconditionerInput};
 
 use crate::convert::{
-    err, get_field_or_null, or_throw, parse_nonnegative_f64, parse_nonnegative_integer,
-    parse_optional_u32, parse_positive_f64, parse_positive_u32, usize_to_i32,
+    err, get_field, optional, or_throw, real_slice, scalar_f64, scalar_u32, scalar_u64,
+    scalar_usize, usize_to_i32,
 };
 
-/// Native interpretation of the R `preconditioner` argument.
-///
-/// A pre-built [`Preconditioner`] takes the reuse path; everything else is a
-/// [`PreconditionerConfig`] (or `None` for the library default) to build from.
-/// Mirrors `PrecondInput` on the Python side.
-pub(crate) enum PreconditionerArg {
-    Config(Option<PreconditionerConfig>),
-    Built(Preconditioner),
+const LSMR_OPTIONS: &str = "within_lsmr_options";
+const APPROX_CHOL: &str = "within_approx_chol_config";
+const APPROX_SCHUR: &str = "within_approx_schur_config";
+const SCHUR: &str = "within_schur";
+const SCALING: &str = "within_scaling_config";
+const LOCAL_SOLVER: &str = "within_local_solver_config";
+const STALENESS: &str = "within_staleness";
+const PRECONDITIONER_CONFIG: &str = "within_preconditioner_config";
+const PRECONDITIONER: &str = "within_preconditioner";
+
+/// Every config object also carries `within_config`, which hosts its `print` method.
+fn classed(list: List, class: &str) -> Result<Robj> {
+    let mut robj: Robj = list.into();
+    robj.set_class([class, "within_config"])?;
+    Ok(robj)
+}
+
+fn expect_class(obj: &Robj, class: &str, what: &str) -> Result<()> {
+    if obj.inherits(class) {
+        Ok(())
+    } else {
+        Err(err(format!(
+            "`{what}` must be created by {}",
+            constructor(class)
+        )))
+    }
+}
+
+fn constructor(class: &str) -> &'static str {
+    match class {
+        LSMR_OPTIONS => "LsmrOptions()",
+        APPROX_CHOL => "ApproxCholConfig()",
+        APPROX_SCHUR => "ApproxSchurConfig()",
+        SCHUR => "Schur$approximate() or Schur$exact()",
+        SCALING => "ScalingConfig()",
+        LOCAL_SOLVER => "LocalSolverConfig()",
+        STALENESS => "Staleness()",
+        _ => "PreconditionerConfig$Off(), $Diagonal(), $Additive(), or $Adaptive()",
+    }
+}
+
+fn int(value: usize, name: &str) -> Result<Robj> {
+    usize_to_i32(value, name).map(Robj::from)
+}
+
+fn opt_robj(value: Option<Robj>) -> Robj {
+    value.unwrap_or_else(nil_value)
 }
 
 // ---------------------------------------------------------------------------
 // LSMR options
 // ---------------------------------------------------------------------------
 
-/// Resolve the R `options` argument into native [`LsmrOptions`].
-///
-/// `NULL` means library defaults; anything else must be created by
-/// `LsmrOptions(...)`. Mirrors `resolve_lsmr_config` on the Python side;
-/// value validation lives here, not in the R constructor.
-pub(crate) fn parse_lsmr_options(options: &Robj) -> Result<LsmrOptions> {
-    if options.is_null() {
-        return Ok(LsmrOptions::default());
+fn parse_lsmr(obj: &Robj) -> Result<LsmrOptions> {
+    expect_class(obj, LSMR_OPTIONS, "options")?;
+    let tol = scalar_f64(&get_field(obj, "tol"), "tol")?;
+    if !tol.is_finite() || tol <= 0.0 {
+        return Err(err("`tol` must be a positive finite number"));
     }
-    if !options.inherits("within_lsmr_options") {
-        return Err(err("options must be created by LsmrOptions(...) or NULL"));
-    }
-
-    let tol = parse_positive_f64(&get_field_or_null(options, "tol"), "tol")?;
-
-    let maxiter = parse_nonnegative_integer(&get_field_or_null(options, "maxiter"), "maxiter")?;
-    if maxiter < 1 {
-        return Err(err("maxiter must be >= 1"));
-    }
-
-    let local_size_obj = get_field_or_null(options, "local_size");
-    let local_size = if local_size_obj.is_null() {
-        None
-    } else {
-        let value = parse_nonnegative_integer(&local_size_obj, "local_size")?;
-        if value < 1 {
-            return Err(err("local_size must be NULL or >= 1"));
-        }
-        Some(value as usize)
-    };
-
     Ok(LsmrOptions {
         tol,
-        maxiter: maxiter as usize,
-        local_size,
+        maxiter: scalar_usize(&get_field(obj, "maxiter"), "maxiter", 1)?,
+        local_size: optional(&get_field(obj, "local_size"), |v| {
+            scalar_usize(v, "local_size", 1)
+        })?,
     })
 }
 
-// ---------------------------------------------------------------------------
-// Preconditioner config conversion
-// ---------------------------------------------------------------------------
+fn lsmr_to_robj(options: &LsmrOptions) -> Result<Robj> {
+    let local_size = options
+        .local_size
+        .map(|v| int(v, "local_size"))
+        .transpose()?;
+    classed(
+        list!(
+            tol = options.tol,
+            maxiter = int(options.maxiter, "maxiter")?,
+            local_size = opt_robj(local_size)
+        ),
+        LSMR_OPTIONS,
+    )
+}
 
-fn parse_approx_chol_config(obj: &Robj) -> Result<ApproxCholConfig> {
-    if obj.is_null() {
-        return Ok(LocalSolverConfig::default().approx_chol);
+/// `NULL` selects the library defaults.
+pub(crate) fn resolve_lsmr(options: &Robj) -> Result<LsmrOptions> {
+    if options.is_null() {
+        Ok(LsmrOptions::default())
+    } else {
+        parse_lsmr(options)
     }
-    if !obj.inherits("within_approx_chol_config") {
-        return Err(err(
-            "approx_chol must be an object created by ApproxCholConfig(...) or NULL",
-        ));
-    }
+}
 
-    let seed_obj = get_field_or_null(obj, "seed");
-    let split_merge_obj = get_field_or_null(obj, "split_merge");
+// ---------------------------------------------------------------------------
+// Local solver configuration
+// ---------------------------------------------------------------------------
 
-    let seed = parse_nonnegative_integer(&seed_obj, "approx_chol$seed")?;
-
+fn parse_approx_chol(obj: &Robj) -> Result<ApproxCholConfig> {
+    expect_class(obj, APPROX_CHOL, "approx_chol")?;
     Ok(ApproxCholConfig {
-        seed: seed as u64,
-        split_merge: parse_optional_u32(&split_merge_obj, "approx_chol$split_merge")?,
+        seed: scalar_u64(&get_field(obj, "seed"), "seed")?,
+        split_merge: optional(&get_field(obj, "split_merge"), |v| {
+            scalar_u32(v, "split_merge", 1)
+        })?,
     })
 }
 
-fn parse_approx_schur_config(obj: &Robj) -> Result<ApproxSchurConfig> {
-    if obj.is_null() {
-        return Ok(ApproxSchurConfig::default());
-    }
-    if !obj.inherits("within_approx_schur_config") {
-        return Err(err(
-            "schur$config must be an object created by ApproxSchurConfig(...) or NULL",
-        ));
-    }
+fn approx_chol_to_robj(config: &ApproxCholConfig) -> Result<Robj> {
+    let split_merge = config
+        .split_merge
+        .map(|v| int(v as usize, "split_merge"))
+        .transpose()?;
+    classed(
+        list!(
+            seed = config.seed as f64,
+            split_merge = opt_robj(split_merge)
+        ),
+        APPROX_CHOL,
+    )
+}
 
-    let seed_obj = get_field_or_null(obj, "seed");
-    let split_obj = get_field_or_null(obj, "split");
-
-    let seed = parse_nonnegative_integer(&seed_obj, "schur$config$seed")?;
-
+fn parse_approx_schur(obj: &Robj) -> Result<ApproxSchurConfig> {
+    expect_class(obj, APPROX_SCHUR, "config")?;
     Ok(ApproxSchurConfig {
-        seed: seed as u64,
-        split: parse_positive_u32(&split_obj, "schur$config$split")?,
+        split: scalar_u32(&get_field(obj, "split"), "split", 1)?,
     })
 }
 
-fn parse_schur_mode(obj: &Robj) -> Result<SchurMode> {
-    if obj.is_null() {
-        return Ok(SchurMode::default());
-    }
-    if obj.inherits("within_schur_exact") {
-        return Ok(SchurMode::Exact);
-    }
-    if obj.inherits("within_schur_approximate") {
-        return parse_approx_schur_config(&get_field_or_null(obj, "config"))
-            .map(SchurMode::Approximate);
-    }
-    Err(err(
-        "schur must be Schur$Exact, Schur$Approximate(...), or NULL",
-    ))
+fn approx_schur_to_robj(config: &ApproxSchurConfig) -> Result<Robj> {
+    classed(
+        list!(split = int(config.split as usize, "split")?),
+        APPROX_SCHUR,
+    )
 }
 
-fn parse_scaling_config(obj: &Robj) -> Result<ScalingConfig> {
-    if obj.is_null() {
-        return Ok(ScalingConfig::default());
+fn parse_schur(obj: &Robj) -> Result<SchurMode> {
+    expect_class(obj, SCHUR, "schur")?;
+    match get_field(obj, "mode").as_str() {
+        Some("exact") => Ok(SchurMode::Exact),
+        Some("approximate") => Ok(SchurMode::Approximate(
+            optional(&get_field(obj, "config"), parse_approx_schur)?.unwrap_or_default(),
+        )),
+        _ => Err(err("`schur$mode` must be \"approximate\" or \"exact\"")),
     }
-    if !obj.inherits("within_scaling_config") {
-        return Err(err(
-            "scaling must be an object created by ScalingConfig(...) or NULL",
-        ));
-    }
+}
 
+fn schur_to_robj(mode: &SchurMode) -> Result<Robj> {
+    match mode {
+        SchurMode::Exact => classed(list!(mode = "exact", config = nil_value()), SCHUR),
+        SchurMode::Approximate(config) => classed(
+            list!(mode = "approximate", config = approx_schur_to_robj(config)?),
+            SCHUR,
+        ),
+    }
+}
+
+fn parse_scaling(obj: &Robj) -> Result<ScalingConfig> {
+    expect_class(obj, SCALING, "scaling")?;
     let defaults = ScalingConfig::default();
-    let tolerance_obj = get_field_or_null(obj, "tolerance");
-    let max_iterations_obj = get_field_or_null(obj, "max_iterations");
-    let on_failure_obj = get_field_or_null(obj, "on_failure");
-
-    let tolerance = if tolerance_obj.is_null() {
-        defaults.tolerance
-    } else {
-        parse_nonnegative_f64(&tolerance_obj, "scaling$tolerance")?
-    };
-    let max_iterations = if max_iterations_obj.is_null() {
-        defaults.max_iterations
-    } else {
-        let value = parse_nonnegative_integer(&max_iterations_obj, "scaling$max_iterations")?;
-        if value < 1 {
-            return Err(err("scaling$max_iterations must be >= 1"));
-        }
-        usize::try_from(value).map_err(|_| err("scaling$max_iterations is too large"))?
-    };
-    let on_failure = if on_failure_obj.is_null() {
-        defaults.on_failure
-    } else {
-        match on_failure_obj.as_str() {
-            Some("warn") => ScalingFailure::Warn,
-            Some("error") => ScalingFailure::Error,
-            _ => {
-                return Err(err(
-                    "scaling$on_failure must be ScalingFailure$Warn or ScalingFailure$Error",
-                ))
-            }
+    let on_failure = match optional(&get_field(obj, "on_failure"), |v| {
+        v.as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| err("`on_failure` must be \"warn\" or \"error\""))
+    })?
+    .as_deref()
+    {
+        None => defaults.on_failure,
+        Some("warn") => ScalingFailure::Warn,
+        Some("error") => ScalingFailure::Error,
+        Some(other) => {
+            return Err(err(format!(
+                "`on_failure` must be \"warn\" or \"error\", got \"{other}\""
+            )))
         }
     };
-
     Ok(ScalingConfig {
-        tolerance,
-        max_iterations,
+        tolerance: optional(&get_field(obj, "tolerance"), |v| scalar_f64(v, "tolerance"))?
+            .unwrap_or(defaults.tolerance),
+        max_iterations: optional(&get_field(obj, "max_iterations"), |v| {
+            scalar_usize(v, "max_iterations", 0)
+        })?
+        .unwrap_or(defaults.max_iterations),
         on_failure,
     })
 }
 
-fn parse_local_solver_config(obj: &Robj) -> Result<LocalSolverConfig> {
-    if obj.is_null() {
-        return Ok(LocalSolverConfig::default());
-    }
-    if !obj.inherits("within_local_solver_config") {
-        return Err(err(
-            "local_solver must be an object created by LocalSolverConfig(...) or NULL",
-        ));
-    }
-
-    let approx_chol_obj = get_field_or_null(obj, "approx_chol");
-    let schur_obj = get_field_or_null(obj, "schur");
-    let dense_threshold_obj = get_field_or_null(obj, "dense_threshold");
-    let scaling_obj = get_field_or_null(obj, "scaling");
-    let ridge_obj = get_field_or_null(obj, "ridge");
-
-    let mut config = LocalSolverConfig::default();
-    if !approx_chol_obj.is_null() {
-        config.approx_chol = parse_approx_chol_config(&approx_chol_obj)?;
-    }
-    if !schur_obj.is_null() {
-        config.schur = parse_schur_mode(&schur_obj)?;
-    }
-    if !dense_threshold_obj.is_null() {
-        let value =
-            parse_nonnegative_integer(&dense_threshold_obj, "local_solver$dense_threshold")?;
-        config.dense_threshold =
-            usize::try_from(value).map_err(|_| err("local_solver$dense_threshold is too large"))?;
-    }
-    if !scaling_obj.is_null() {
-        config.scaling = parse_scaling_config(&scaling_obj)?;
-    }
-    if !ridge_obj.is_null() {
-        config.ridge = parse_nonnegative_f64(&ridge_obj, "local_solver$ridge")?;
-    }
-    Ok(config)
-}
-
-fn parse_reduction_strategy(obj: &Robj) -> Result<ReductionStrategy> {
-    if obj.is_null() {
-        return Ok(ReductionStrategy::default());
-    }
-    let Some(name) = obj.as_str() else {
-        return Err(err("reduction must be a character scalar"));
+fn scaling_to_robj(config: &ScalingConfig) -> Result<Robj> {
+    let on_failure = match config.on_failure {
+        ScalingFailure::Warn => "warn",
+        ScalingFailure::Error => "error",
     };
-    match name {
-        "auto" => Ok(ReductionStrategy::Auto),
-        "atomic_scatter" => Ok(ReductionStrategy::AtomicScatter),
-        "parallel_reduction" => Ok(ReductionStrategy::ParallelReduction),
-        other => Err(err(format!(
-            "unknown reduction strategy '{other}'; use 'auto', 'atomic_scatter', or 'parallel_reduction'"
-        ))),
-    }
+    classed(
+        list!(
+            tolerance = config.tolerance,
+            max_iterations = int(config.max_iterations, "max_iterations")?,
+            on_failure = on_failure
+        ),
+        SCALING,
+    )
 }
 
-fn parse_preconditioner_string(name: &str) -> Result<PreconditionerArg> {
-    match name {
-        "adaptive" => Ok(PreconditionerArg::Config(Some(
-            PreconditionerConfig::default(),
-        ))),
-        "additive" => Ok(PreconditionerArg::Config(Some(
-            PreconditionerConfig::Additive {
-                local_solver: LocalSolverConfig::default(),
-                reduction: ReductionStrategy::default(),
-            },
-        ))),
-        "off" => Ok(PreconditionerArg::Config(Some(PreconditionerConfig::Off))),
-        "diagonal" => Ok(PreconditionerArg::Config(Some(
-            PreconditionerConfig::Diagonal,
-        ))),
-        other => Err(err(format!(
-            "unknown preconditioner '{other}'; use PreconditionerConfig$Additive, \
-             PreconditionerConfig$Off, PreconditionerConfig$Diagonal, AdditiveSchwarz(...), \
-             a Preconditioner, or NULL"
-        ))),
-    }
+fn parse_local_solver(obj: &Robj) -> Result<LocalSolverConfig> {
+    expect_class(obj, LOCAL_SOLVER, "local_solver")?;
+    let defaults = LocalSolverConfig::default();
+    Ok(LocalSolverConfig {
+        approx_chol: optional(&get_field(obj, "approx_chol"), parse_approx_chol)?
+            .unwrap_or(defaults.approx_chol),
+        schur: optional(&get_field(obj, "schur"), parse_schur)?.unwrap_or(defaults.schur),
+        dense_threshold: optional(&get_field(obj, "dense_threshold"), |v| {
+            scalar_usize(v, "dense_threshold", 0)
+        })?
+        .unwrap_or(defaults.dense_threshold),
+        scaling: optional(&get_field(obj, "scaling"), parse_scaling)?.unwrap_or(defaults.scaling),
+    })
 }
 
-pub(crate) fn parse_preconditioner(preconditioner: Robj) -> Result<PreconditionerArg> {
-    if preconditioner.is_null() {
-        return Ok(PreconditionerArg::Config(None));
-    }
+fn local_solver_to_robj(config: &LocalSolverConfig) -> Result<Robj> {
+    classed(
+        list!(
+            approx_chol = approx_chol_to_robj(&config.approx_chol)?,
+            schur = schur_to_robj(&config.schur)?,
+            dense_threshold = int(config.dense_threshold, "dense_threshold")?,
+            scaling = scaling_to_robj(&config.scaling)?
+        ),
+        LOCAL_SOLVER,
+    )
+}
 
-    // A `within_preconditioner` R object is an environment holding the
-    // external pointer in `$ptr`; a bare external pointer is accepted too.
-    let ptr_obj = if preconditioner.inherits("within_preconditioner") {
-        get_field_or_null(&preconditioner, "ptr")
-    } else {
-        preconditioner.clone()
+fn parse_staleness(obj: &Robj) -> Result<Staleness> {
+    expect_class(obj, STALENESS, "stall")?;
+    let defaults = Staleness::default();
+    let window = optional(&get_field(obj, "window"), |v| scalar_usize(v, "window", 0))?
+        .unwrap_or(defaults.window());
+    let threshold = optional(&get_field(obj, "threshold"), |v| scalar_f64(v, "threshold"))?
+        .unwrap_or(defaults.threshold());
+    Staleness::try_new(window, threshold).map_err(|e| err(e.to_string()))
+}
+
+fn staleness_to_robj(stall: &Staleness) -> Result<Robj> {
+    classed(
+        list!(
+            window = int(stall.window(), "window")?,
+            threshold = stall.threshold()
+        ),
+        STALENESS,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Preconditioner configuration
+// ---------------------------------------------------------------------------
+
+fn parse_preconditioner_config(obj: &Robj) -> Result<PreconditionerConfig> {
+    expect_class(obj, PRECONDITIONER_CONFIG, "preconditioner")?;
+    let local_solver = || -> Result<LocalSolverConfig> {
+        Ok(optional(&get_field(obj, "local_solver"), parse_local_solver)?.unwrap_or_default())
     };
-    if let Ok(ptr) = ExternalPtr::<Preconditioner>::try_from(ptr_obj) {
-        return Ok(PreconditionerArg::Built(ptr.try_addr()?.clone()));
+    match get_field(obj, "variant").as_str() {
+        Some("Off") => Ok(PreconditionerConfig::Off),
+        Some("Diagonal") => Ok(PreconditionerConfig::Diagonal),
+        Some("Additive") => Ok(PreconditionerConfig::Additive {
+            local_solver: local_solver()?,
+        }),
+        Some("Adaptive") => Ok(PreconditionerConfig::Adaptive {
+            local_solver: local_solver()?,
+            stall: optional(&get_field(obj, "stall"), parse_staleness)?.unwrap_or_default(),
+        }),
+        _ => Err(err(
+            "`preconditioner$variant` must be \"Off\", \"Diagonal\", \"Additive\", or \"Adaptive\"",
+        )),
     }
+}
 
-    if let Some(name) = preconditioner.as_str() {
-        return parse_preconditioner_string(name);
-    }
+fn preconditioner_config_to_robj(config: &PreconditionerConfig) -> Result<Robj> {
+    let list = match config {
+        PreconditionerConfig::Off => list!(variant = "Off"),
+        PreconditionerConfig::Diagonal => list!(variant = "Diagonal"),
+        PreconditionerConfig::Additive { local_solver } => list!(
+            variant = "Additive",
+            local_solver = local_solver_to_robj(local_solver)?
+        ),
+        PreconditionerConfig::Adaptive {
+            local_solver,
+            stall,
+        } => list!(
+            variant = "Adaptive",
+            local_solver = local_solver_to_robj(local_solver)?,
+            stall = staleness_to_robj(stall)?
+        ),
+        _ => return Err(err("unsupported preconditioner configuration")),
+    };
+    classed(list, PRECONDITIONER_CONFIG)
+}
 
-    if preconditioner.inherits("within_adaptive") {
-        let window =
-            parse_nonnegative_integer(&get_field_or_null(&preconditioner, "window"), "window")?;
-        let threshold = parse_nonnegative_f64(
-            &get_field_or_null(&preconditioner, "threshold"),
-            "threshold",
-        )?;
-        let stall =
-            Staleness::try_new(window as usize, threshold).map_err(|e| err(e.to_string()))?;
-        return Ok(PreconditionerArg::Config(Some(
-            PreconditionerConfig::Adaptive {
-                local_solver: parse_local_solver_config(&get_field_or_null(
-                    &preconditioner,
-                    "local_solver",
-                ))?,
-                reduction: parse_reduction_strategy(&get_field_or_null(
-                    &preconditioner,
-                    "reduction",
-                ))?,
-                stall,
-            },
-        )));
+/// Resolve the R `preconditioner` argument: `NULL` (library default), a
+/// `PreconditionerConfig$...()` object, or a built `Preconditioner`.
+pub(crate) fn resolve_preconditioner(obj: &Robj) -> Result<PreconditionerInput> {
+    if obj.is_null() {
+        return Ok(PreconditionerInput::Default);
     }
-    if preconditioner.inherits("within_additive_schwarz") {
-        let local_solver =
-            parse_local_solver_config(&get_field_or_null(&preconditioner, "local_solver"))?;
-        let reduction = parse_reduction_strategy(&get_field_or_null(&preconditioner, "reduction"))?;
-        return Ok(PreconditionerArg::Config(Some(
-            PreconditionerConfig::Additive {
-                local_solver,
-                reduction,
-            },
-        )));
+    if obj.inherits(PRECONDITIONER) {
+        return Ok(PreconditionerInput::Prebuilt(preconditioner_handle(
+            &get_field(obj, "ptr"),
+        )?));
     }
-
+    if obj.inherits(PRECONDITIONER_CONFIG) {
+        return parse_preconditioner_config(obj).map(PreconditionerInput::Config);
+    }
     Err(err(
-        "preconditioner must be NULL, 'additive', 'off', 'diagonal', AdditiveSchwarz(...), or a Preconditioner",
+        "`preconditioner` must be NULL, PreconditionerConfig$Off(), $Diagonal(), \
+         $Additive(...), $Adaptive(...), or a built Preconditioner",
     ))
 }
 
+// Validate a config object and return it fully resolved, with library defaults filled in.
+#[extendr]
+fn config_normalize_impl(obj: Robj) -> Robj {
+    or_throw((|| -> Result<Robj> {
+        let class = obj
+            .class()
+            .and_then(|mut classes| classes.next().map(str::to_owned))
+            .unwrap_or_default();
+        match class.as_str() {
+            LSMR_OPTIONS => lsmr_to_robj(&parse_lsmr(&obj)?),
+            APPROX_CHOL => approx_chol_to_robj(&parse_approx_chol(&obj)?),
+            APPROX_SCHUR => approx_schur_to_robj(&parse_approx_schur(&obj)?),
+            SCHUR => schur_to_robj(&parse_schur(&obj)?),
+            SCALING => scaling_to_robj(&parse_scaling(&obj)?),
+            LOCAL_SOLVER => local_solver_to_robj(&parse_local_solver(&obj)?),
+            STALENESS => staleness_to_robj(&parse_staleness(&obj)?),
+            PRECONDITIONER_CONFIG => {
+                preconditioner_config_to_robj(&parse_preconditioner_config(&obj)?)
+            }
+            other => Err(err(format!("unknown configuration class \"{other}\""))),
+        }
+    })())
+}
+
 // ---------------------------------------------------------------------------
-// Preconditioner handle API
+// Built preconditioner handle
 // ---------------------------------------------------------------------------
 
-// Apply a built preconditioner: y = M^{-1} x.
+/// Clone the native preconditioner behind an R handle; the clone is O(1).
+fn preconditioner_handle(ptr: &Robj) -> Result<Preconditioner> {
+    let ptr = ExternalPtr::<Preconditioner>::try_from(ptr.clone())
+        .map_err(|_| err("invalid Preconditioner handle"))?;
+    Ok(ptr.try_addr()?.clone())
+}
+
+// Apply a built preconditioner: `y = M^{-1} x`.
 #[extendr]
-fn preconditioner_apply_impl(preconditioner: ExternalPtr<Preconditioner>, x: &[f64]) -> Vec<f64> {
+fn preconditioner_apply_impl(preconditioner: ExternalPtr<Preconditioner>, x: Robj) -> Vec<f64> {
     or_throw((|| -> Result<Vec<f64>> {
         let inner = preconditioner.try_addr()?;
+        let x = real_slice(&x, "x")?;
         if x.len() != inner.ncols() {
             return Err(err(format!(
-                "x has length {} but preconditioner expects {}",
+                "`x` has length {} but the preconditioner expects {}",
                 x.len(),
                 inner.ncols()
             )));
@@ -342,104 +389,22 @@ fn preconditioner_apply_impl(preconditioner: ExternalPtr<Preconditioner>, x: &[f
     })())
 }
 
-// Number of rows in a built preconditioner.
+// Shape, variant, configuration, and build time of a built preconditioner.
 #[extendr]
-fn preconditioner_nrows_impl(preconditioner: ExternalPtr<Preconditioner>) -> i32 {
-    or_throw((|| -> Result<i32> {
-        usize_to_i32(preconditioner.try_addr()?.nrows(), "nrows")
-    })())
-}
-
-// Number of columns in a built preconditioner.
-#[extendr]
-fn preconditioner_ncols_impl(preconditioner: ExternalPtr<Preconditioner>) -> i32 {
-    or_throw((|| -> Result<i32> {
-        usize_to_i32(preconditioner.try_addr()?.ncols(), "ncols")
-    })())
-}
-
-// Concrete preconditioner variant name (used by the R print method, matching
-// the Python __repr__).
-#[extendr]
-fn preconditioner_variant_impl(preconditioner: ExternalPtr<Preconditioner>) -> String {
-    or_throw((|| -> Result<String> {
-        Ok(preconditioner.try_addr()?.variant_name().to_string())
-    })())
-}
-
-fn reduction_name(reduction: ReductionStrategy) -> &'static str {
-    match reduction {
-        ReductionStrategy::Auto => "auto",
-        ReductionStrategy::AtomicScatter => "atomic_scatter",
-        ReductionStrategy::ParallelReduction => "parallel_reduction",
-    }
-}
-
-fn scaling_failure_name(on_failure: ScalingFailure) -> &'static str {
-    match on_failure {
-        ScalingFailure::Warn => "warn",
-        ScalingFailure::Error => "error",
-    }
-}
-
-fn local_solver_to_list(config: &LocalSolverConfig) -> List {
-    let schur = match &config.schur {
-        SchurMode::Approximate(approx) => list!(
-            variant = "approximate",
-            seed = approx.seed as f64,
-            split = approx.split as f64
-        ),
-        SchurMode::Exact => list!(variant = "exact"),
-    };
-    list!(
-        approx_chol = list!(
-            seed = config.approx_chol.seed as f64,
-            split_merge = config.approx_chol.split_merge.map(f64::from)
-        ),
-        schur = schur,
-        dense_threshold = config.dense_threshold as f64,
-        scaling = list!(
-            tolerance = config.scaling.tolerance,
-            max_iterations = config.scaling.max_iterations as f64,
-            on_failure = scaling_failure_name(config.scaling.on_failure)
-        ),
-        ridge = config.ridge
-    )
-}
-
-// Complete normalized construction configuration for a built preconditioner.
-// The wildcard keeps this bridge source-compatible when the non-exhaustive
-// native enum gains a strategy: callers still receive the concrete variant.
-#[extendr]
-fn preconditioner_config_impl(preconditioner: ExternalPtr<Preconditioner>) -> List {
+fn preconditioner_info_impl(preconditioner: ExternalPtr<Preconditioner>) -> List {
     or_throw((|| -> Result<List> {
         let inner = preconditioner.try_addr()?;
-        let variant = inner.variant_name().to_string();
-        Ok(match inner.config() {
-            PreconditionerConfig::Off => list!(variant = variant),
-            PreconditionerConfig::Diagonal => list!(variant = variant),
-            PreconditionerConfig::Additive {
-                local_solver,
-                reduction,
-            } => list!(
-                variant = variant,
-                local_solver = local_solver_to_list(&local_solver),
-                reduction = reduction_name(reduction)
-            ),
-            _ => list!(variant = variant),
-        })
+        Ok(list!(
+            nrows = int(inner.nrows(), "nrows")?,
+            ncols = int(inner.ncols(), "ncols")?,
+            variant = inner.variant_name(),
+            config = preconditioner_config_to_robj(&inner.config())?,
+            build_duration_seconds = inner.build_duration().as_secs_f64()
+        ))
     })())
 }
 
-// Original preconditioner build duration, preserved across serialization.
-#[extendr]
-fn preconditioner_build_duration_impl(preconditioner: ExternalPtr<Preconditioner>) -> f64 {
-    or_throw((|| -> Result<f64> {
-        Ok(preconditioner.try_addr()?.build_duration().as_secs_f64())
-    })())
-}
-
-// Serialize a built preconditioner into raw bytes.
+// Serialize a built preconditioner to raw bytes (the R analogue of pickling).
 #[extendr]
 fn preconditioner_serialize_impl(preconditioner: ExternalPtr<Preconditioner>) -> Raw {
     or_throw((|| -> Result<Raw> {
@@ -453,20 +418,17 @@ fn preconditioner_serialize_impl(preconditioner: ExternalPtr<Preconditioner>) ->
 #[extendr]
 fn preconditioner_deserialize_impl(data: Raw) -> ExternalPtr<Preconditioner> {
     or_throw((|| -> Result<ExternalPtr<Preconditioner>> {
-        let preconditioner: Preconditioner =
-            postcard::from_bytes(data.as_slice()).map_err(|e| err(e.to_string()))?;
+        let preconditioner: Preconditioner = postcard::from_bytes(data.as_slice())
+            .map_err(|e| err(format!("failed to deserialize preconditioner: {e}")))?;
         Ok(ExternalPtr::new(preconditioner))
     })())
 }
 
 extendr_module! {
     mod config;
+    fn config_normalize_impl;
     fn preconditioner_apply_impl;
-    fn preconditioner_nrows_impl;
-    fn preconditioner_ncols_impl;
-    fn preconditioner_variant_impl;
-    fn preconditioner_config_impl;
-    fn preconditioner_build_duration_impl;
+    fn preconditioner_info_impl;
     fn preconditioner_serialize_impl;
     fn preconditioner_deserialize_impl;
 }
