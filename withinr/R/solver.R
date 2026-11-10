@@ -30,28 +30,28 @@
 #' solver$has_escalated
 #' @export
 Solver <- function(design, weights = NULL, preconditioner = NULL) {
-  native <- solver_new_impl(
+  built <- native(solver_new_impl(
     as_design(design), as_weights(weights), as_preconditioner(preconditioner)
-  )
-  emit_build_warnings(native$warnings)
-  ptr <- native$ptr
+  ))
+  emit_build_warnings(built$warnings)
+  ptr <- built$ptr
 
   solver <- new.env(parent = emptyenv())
   solver$ptr <- ptr
-  solver$n_dofs <- native$n_dofs
-  solver$n_obs <- native$n_obs
+  solver$n_dofs <- built$n_dofs
+  solver$n_obs <- built$n_obs
   solver$solve <- function(y, options = NULL) {
-    solve_result(solver_solve_impl(ptr, as_response(y), as_options(options)))
+    solve_result(native(solver_solve_impl(ptr, as_response(y), as_options(options))))
   }
   solver$solve_batch <- function(Y, options = NULL) {
     Y <- as_response_matrix(Y)
-    batch_result(solver_solve_batch_impl(ptr, Y, as_options(options)), Y)
+    batch_result(native(solver_solve_batch_impl(ptr, Y, as_options(options))), Y)
   }
   makeActiveBinding("preconditioner", function() {
-    handle <- solver_preconditioner_impl(ptr)
+    handle <- native(solver_preconditioner_impl(ptr))
     if (is.null(handle)) NULL else new_preconditioner(handle)
   }, solver)
-  makeActiveBinding("has_escalated", function() solver_has_escalated_impl(ptr), solver)
+  makeActiveBinding("has_escalated", function() native(solver_has_escalated_impl(ptr)), solver)
   lockEnvironment(solver, bindings = TRUE)
   structure(solver, class = "within_solver")
 }
@@ -63,7 +63,7 @@ print.within_solver <- function(x, ...) {
 }
 
 new_preconditioner <- function(ptr) {
-  info <- preconditioner_info_impl(ptr)
+  info <- native(preconditioner_info_impl(ptr))
   preconditioner <- new.env(parent = emptyenv())
   preconditioner$ptr <- ptr
   preconditioner$nrows <- info$nrows
@@ -71,8 +71,8 @@ new_preconditioner <- function(ptr) {
   preconditioner$variant <- info$variant
   preconditioner$config <- info$config
   preconditioner$build_duration_seconds <- info$build_duration_seconds
-  preconditioner$apply <- function(x) preconditioner_apply_impl(ptr, as_response(x, "x"))
-  preconditioner$serialize <- function() preconditioner_serialize_impl(ptr)
+  preconditioner$apply <- function(x) native(preconditioner_apply_impl(ptr, as_response(x, "x")))
+  preconditioner$serialize <- function() native(preconditioner_serialize_impl(ptr))
   lockEnvironment(preconditioner, bindings = TRUE)
   structure(preconditioner, class = "within_preconditioner")
 }
@@ -103,9 +103,9 @@ new_preconditioner <- function(ptr) {
 #' @export
 Preconditioner <- function(data) {
   if (!is.raw(data)) {
-    stop("`data` must be a raw vector produced by `$serialize()`", call. = FALSE)
+    abort("`data` must be a raw vector produced by `$serialize()`")
   }
-  new_preconditioner(preconditioner_deserialize_impl(data))
+  new_preconditioner(native(preconditioner_deserialize_impl(data)))
 }
 
 #' @export

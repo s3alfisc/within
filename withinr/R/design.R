@@ -4,7 +4,7 @@
 
 # Factor labels: factors and character vectors use their level codes (1..K);
 # numeric labels are non-negative whole numbers, passed through unchanged.
-as_labels <- function(x, name) {
+as_labels <- function(x, name, nrow = NULL) {
   if (is.factor(x)) {
     return(as.integer(x))
   }
@@ -15,17 +15,27 @@ as_labels <- function(x, name) {
     return(x) # NA and negative labels are rejected natively.
   }
   if (is.double(x)) {
-    if (anyNA(x) || any(!is.finite(x)) || any(x != trunc(x)) ||
-        any(x < 0) || any(x > .Machine$integer.max)) {
-      stop(sprintf(
-        "`%s` labels must be non-negative whole numbers without NA", name
-      ), call. = FALSE)
+    # NA passes through as NA_integer_, which the native side reports by
+    # position; every other bad value is reported here.
+    bad <- which(!is.na(x) & (!is.finite(x) | x != trunc(x) | x < 0 |
+                                x > .Machine$integer.max))
+    if (length(bad)) {
+      at <- bad[[1L]]
+      where <- if (is.null(nrow)) {
+        sprintf("position %d", at)
+      } else {
+        sprintf("row %d, column %d", (at - 1L) %% nrow + 1L, (at - 1L) %/% nrow + 1L)
+      }
+      abort(sprintf(
+        "`%s` labels must be non-negative whole numbers; found %s at %s",
+        name, format(x[[at]]), where
+      ))
     }
     return(as.integer(x))
   }
-  stop(sprintf(
+  abort(sprintf(
     "`%s` must hold factor labels (integer, numeric, factor, or character)", name
-  ), call. = FALSE)
+  ))
 }
 
 as_slopes <- function(slopes) {
@@ -42,17 +52,14 @@ as_slopes <- function(slopes) {
   } else if (is.numeric(slopes)) {
     slopes <- list(slopes)
   } else if (!is.list(slopes)) {
-    stop("`slopes` must be NULL, a numeric vector, a matrix, a data frame, or a list",
-         call. = FALSE)
+    abort("`slopes` must be NULL, a numeric vector, a matrix, a data frame, or a list")
   }
   lapply(seq_along(slopes), function(j) {
     slope <- slopes[[j]]
-    if (!is.numeric(slope)) stop(sprintf("slope %d must be numeric", j), call. = FALSE)
-    slope <- as.double(slope)
-    if (any(!is.finite(slope))) {
-      stop(sprintf("slope %d must be finite (no NA, NaN, or Inf)", j), call. = FALSE)
+    if (!is.numeric(slope) || !is.null(dim(slope))) {
+      abort(sprintf("slope %d must be a numeric vector", j))
     }
-    slope
+    as.double(slope)
   }) |> stats::setNames(names(slopes))
 }
 
@@ -80,22 +87,15 @@ as_slopes <- function(slopes) {
 #' within_solve(design, c(1, 2, 3, 5, 4, 8))$demeaned
 #' @export
 Effect <- function(levels, intercept = TRUE, slopes = NULL) {
-  levels <- as_labels(levels, "levels")
-  if (!is.logical(intercept) || length(intercept) != 1L || is.na(intercept)) {
-    stop("`intercept` must be TRUE or FALSE", call. = FALSE)
-  }
-  slopes <- as_slopes(slopes)
-  if (any(lengths(slopes) != length(levels))) {
-    stop("each slope must have one value per observation (the length of `levels`)",
-         call. = FALSE)
-  }
-  if (!intercept && length(slopes) == 0L) {
-    stop("an Effect needs an intercept or at least one slope", call. = FALSE)
-  }
-  structure(
-    list(levels = levels, intercept = intercept, slopes = slopes),
+  effect <- structure(
+    list(levels = as_labels(levels, "levels"), intercept = intercept,
+         slopes = as_slopes(slopes)),
     class = "within_effect"
   )
+  # The native `Effect` constructor checks slope lengths and finiteness, and
+  # that the term has an intercept or a slope, as Python's `Effect` does.
+  native(effect_validate_impl(effect))
+  effect
 }
 
 #' @export
@@ -116,30 +116,34 @@ as_design <- function(design) {
   if (inherits(design, "within_effect")) {
     return(list(design))
   }
-  if (is.data.frame(design)) {
-    columns <- lapply(seq_along(design), function(j) {
-      as_labels(design[[j]], sprintf("design column %d", j))
+  if (is.data.frame(design) || (is.matrix(design) && is.character(design))) {
+    # Each column gets its own level codes, as each column is its own factor.
+    n_columns <- NCOL(design)
+    if (n_columns == 0L) abort("`design` has no factor columns")
+    columns <- lapply(seq_len(n_columns), function(j) {
+      column <- if (is.data.frame(design)) design[[j]] else design[, j]
+      as_labels(column, sprintf("design column %d", j))
     })
-    return(matrix(unlist(columns, use.names = FALSE), ncol = length(columns)))
+    return(matrix(unlist(columns, use.names = FALSE), ncol = n_columns))
   }
   if (is.matrix(design)) {
+    if (ncol(design) == 0L) abort("`design` has no factor columns")
     if (is.integer(design)) return(design)
-    labels <- as_labels(as.vector(design), "design")
+    labels <- as_labels(as.vector(design), "design", nrow = nrow(design))
     return(matrix(labels, nrow = nrow(design), ncol = ncol(design)))
   }
   if (is.list(design)) {
     if (!length(design) || !all(vapply(design, inherits, logical(1), "within_effect"))) {
-      stop("a list `design` must contain only Effect() terms", call. = FALSE)
+      abort("a list `design` must contain only Effect() terms")
     }
     return(design)
   }
   if (is.atomic(design) && is.null(dim(design))) {
     return(matrix(as_labels(design, "design"), ncol = 1L))
   }
-  stop(
+  abort(
     "`design` must be a Design(), a matrix or data frame of factor labels, ",
-    "or a list of Effect() terms",
-    call. = FALSE
+    "or a list of Effect() terms"
   )
 }
 
@@ -164,7 +168,7 @@ Design <- function(design) {
   if (inherits(design, "within_design")) {
     return(design)
   }
-  structure(design_new_impl(design), class = "within_design")
+  structure(native(design_new_impl(design)), class = "within_design")
 }
 
 #' @export

@@ -3,11 +3,15 @@
 //!
 //! Mirrors `crates/within-py/src/config.rs`. Each R constructor
 //! (`LsmrOptions()`, `LocalSolverConfig()`, `PreconditionerConfig$Adaptive()`,
-//! ...) round-trips its arguments through [`config_normalize_impl`]: the
-//! arguments are parsed into the native type — so validation and defaults live
-//! only in the core — and converted back into a fully resolved, classed R
-//! list. `Preconditioner$config` uses the same conversion, so two equal
+//! ...) round-trips its arguments through [`config_normalize_impl`]: they are
+//! parsed into the native type, which fills in the core's defaults and applies
+//! its validation, and converted back into a fully resolved, classed R list.
+//! `Preconditioner$config` uses the same conversion, so two equal
 //! configurations are `identical()` in R just as they compare equal in Python.
+//!
+//! The bridge itself only checks what the Python constructors check (types,
+//! and `split >= 1`) plus R's representability: whole numbers up to
+//! `.Machine$integer.max`, and seeds up to 2^53, the doubles that are exact.
 
 use extendr_api::{error::Result, prelude::*};
 
@@ -18,7 +22,7 @@ use within::config::{
 use within::{Preconditioner, PreconditionerInput};
 
 use crate::convert::{
-    err, get_field, optional, or_throw, real_slice, scalar_f64, scalar_u32, scalar_u64,
+    err, get_field, guarded, handle, optional, real_slice, scalar_f64, scalar_u32, scalar_u64,
     scalar_usize, usize_to_i32,
 };
 
@@ -77,15 +81,11 @@ fn opt_robj(value: Option<Robj>) -> Robj {
 
 fn parse_lsmr(obj: &Robj) -> Result<LsmrOptions> {
     expect_class(obj, LSMR_OPTIONS, "options")?;
-    let tol = scalar_f64(&get_field(obj, "tol"), "tol")?;
-    if !tol.is_finite() || tol <= 0.0 {
-        return Err(err("`tol` must be a positive finite number"));
-    }
     Ok(LsmrOptions {
-        tol,
-        maxiter: scalar_usize(&get_field(obj, "maxiter"), "maxiter", 1)?,
+        tol: scalar_f64(&get_field(obj, "tol"), "tol")?,
+        maxiter: scalar_usize(&get_field(obj, "maxiter"), "maxiter", 0)?,
         local_size: optional(&get_field(obj, "local_size"), |v| {
-            scalar_usize(v, "local_size", 1)
+            scalar_usize(v, "local_size", 0)
         })?,
     })
 }
@@ -123,7 +123,7 @@ fn parse_approx_chol(obj: &Robj) -> Result<ApproxCholConfig> {
     Ok(ApproxCholConfig {
         seed: scalar_u64(&get_field(obj, "seed"), "seed")?,
         split_merge: optional(&get_field(obj, "split_merge"), |v| {
-            scalar_u32(v, "split_merge", 1)
+            scalar_u32(v, "split_merge", 0)
         })?,
     })
 }
@@ -338,7 +338,7 @@ pub(crate) fn resolve_preconditioner(obj: &Robj) -> Result<PreconditionerInput> 
 // Validate a config object and return it fully resolved, with library defaults filled in.
 #[extendr]
 fn config_normalize_impl(obj: Robj) -> Robj {
-    or_throw((|| -> Result<Robj> {
+    guarded(|| {
         let class = obj
             .class()
             .and_then(|mut classes| classes.next().map(str::to_owned))
@@ -356,7 +356,7 @@ fn config_normalize_impl(obj: Robj) -> Robj {
             }
             other => Err(err(format!("unknown configuration class \"{other}\""))),
         }
-    })())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -365,16 +365,16 @@ fn config_normalize_impl(obj: Robj) -> Robj {
 
 /// Clone the native preconditioner behind an R handle; the clone is O(1).
 fn preconditioner_handle(ptr: &Robj) -> Result<Preconditioner> {
-    let ptr = ExternalPtr::<Preconditioner>::try_from(ptr.clone())
-        .map_err(|_| err("invalid Preconditioner handle"))?;
-    Ok(ptr.try_addr()?.clone())
+    Ok(handle::<Preconditioner>(ptr, "Preconditioner")?
+        .try_addr()?
+        .clone())
 }
 
 // Apply a built preconditioner: `y = M^{-1} x`.
 #[extendr]
-fn preconditioner_apply_impl(preconditioner: ExternalPtr<Preconditioner>, x: Robj) -> Vec<f64> {
-    or_throw((|| -> Result<Vec<f64>> {
-        let inner = preconditioner.try_addr()?;
+fn preconditioner_apply_impl(preconditioner: Robj, x: Robj) -> Vec<f64> {
+    guarded(|| {
+        let inner = preconditioner_handle(&preconditioner)?;
         let x = real_slice(&x, "x")?;
         if x.len() != inner.ncols() {
             return Err(err(format!(
@@ -384,16 +384,16 @@ fn preconditioner_apply_impl(preconditioner: ExternalPtr<Preconditioner>, x: Rob
             )));
         }
         let mut y = vec![0.0; inner.nrows()];
-        crate::threads::run(|| inner.apply(x, &mut y))?.map_err(|e| err(e.to_string()))?;
+        crate::threads::run(|| inner.apply(x, &mut y))?.map_err(crate::convert::solve_err)?;
         Ok(y)
-    })())
+    })
 }
 
 // Shape, variant, configuration, and build time of a built preconditioner.
 #[extendr]
-fn preconditioner_info_impl(preconditioner: ExternalPtr<Preconditioner>) -> List {
-    or_throw((|| -> Result<List> {
-        let inner = preconditioner.try_addr()?;
+fn preconditioner_info_impl(preconditioner: Robj) -> List {
+    guarded(|| {
+        let inner = preconditioner_handle(&preconditioner)?;
         Ok(list!(
             nrows = int(inner.nrows(), "nrows")?,
             ncols = int(inner.ncols(), "ncols")?,
@@ -401,27 +401,30 @@ fn preconditioner_info_impl(preconditioner: ExternalPtr<Preconditioner>) -> List
             config = preconditioner_config_to_robj(&inner.config())?,
             build_duration_seconds = inner.build_duration().as_secs_f64()
         ))
-    })())
+    })
 }
 
 // Serialize a built preconditioner to raw bytes (the R analogue of pickling).
 #[extendr]
-fn preconditioner_serialize_impl(preconditioner: ExternalPtr<Preconditioner>) -> Raw {
-    or_throw((|| -> Result<Raw> {
-        let bytes =
-            postcard::to_stdvec(preconditioner.try_addr()?).map_err(|e| err(e.to_string()))?;
+fn preconditioner_serialize_impl(preconditioner: Robj) -> Raw {
+    guarded(|| {
+        let bytes = postcard::to_stdvec(&preconditioner_handle(&preconditioner)?)
+            .map_err(crate::convert::runtime_err)?;
         Ok(Raw::from_bytes(&bytes))
-    })())
+    })
 }
 
 // Deserialize a built preconditioner from raw bytes.
 #[extendr]
-fn preconditioner_deserialize_impl(data: Raw) -> ExternalPtr<Preconditioner> {
-    or_throw((|| -> Result<ExternalPtr<Preconditioner>> {
-        let preconditioner: Preconditioner = postcard::from_bytes(data.as_slice())
+fn preconditioner_deserialize_impl(data: Robj) -> Robj {
+    guarded(|| {
+        let data = data
+            .as_raw_slice()
+            .ok_or_else(|| err("`data` must be a raw vector"))?;
+        let preconditioner: Preconditioner = postcard::from_bytes(data)
             .map_err(|e| err(format!("failed to deserialize preconditioner: {e}")))?;
-        Ok(ExternalPtr::new(preconditioner))
-    })())
+        Ok(ExternalPtr::new(preconditioner).into())
+    })
 }
 
 extendr_module! {

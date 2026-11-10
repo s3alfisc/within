@@ -40,7 +40,10 @@ Rscript scripts/prepare-r-package.R --clean
 ```
 
 Other modes: `--no-document` writes the scaffolding and core snapshot without
-compiling, which is enough for `cargo check`/`clippy` on the adapter.
+compiling, which is enough for `cargo check`/`clippy` on the adapter (a fresh
+checkout needs this before any `cargo` command, since the tracked
+`Cargo.toml` points at the generated `document.rs` and `within-core/`).
+`--check` fails if `within-core/` no longer matches `crates/`.
 
 What `scripts/prepare-r-package.R` does:
 
@@ -68,13 +71,17 @@ Rscript scripts/prepare-r-package.R --vendor
 Development loop, after generating once:
 
 ```sh
+Rscript scripts/prepare-r-package.R --check   # is the core snapshot current?
 Rscript -e 'pkgload::load_all("withinr"); source("withinr/tests/run_tests.R")'
 cargo fmt --manifest-path withinr/src/rust/Cargo.toml -- --check
 cargo clippy --locked --manifest-path withinr/src/rust/Cargo.toml -- -D warnings
 ```
 
 Rerun `scripts/prepare-r-package.R` after changing an `#[extendr]` signature
-or roxygen docs, or after editing the Rust core.
+or roxygen docs, or after editing the Rust core: the package compiles the
+snapshot in `within-core/`, not `crates/`. `load_all()` builds in debug mode and
+reuses `src/rust/target/debug`; `R CMD INSTALL` builds in release mode and the
+generated Makevars deletes the target directory afterwards unless `DEBUG` is set.
 
 ## API
 
@@ -102,11 +109,17 @@ or roxygen docs, or after editing the Rust core.
 | `result.layout.index(term, level, column)`, `.address(i)` | `result$layout$index(term, level, column)` (vectorized), `$address(i)` (data frame) |
 | `result.unidentified` (list of records)             | `result$unidentified` (data frame `term`, `level`, `column`) |
 | build warnings as `UserWarning`                     | warnings of class `within_build_warning`             |
+| `ValueError` / `TypeError`                          | errors of class `within_input_error`                 |
+| `RuntimeError`                                      | errors of class `within_runtime_error`               |
 
-Like Python, every config is validated by the native library when constructed
-and holds its effective values (`LocalSolverConfig()$approx_chol$split_merge`
-is `2`); equal configs are `identical()`, and `Preconditioner$config`
-round-trips (`identical(p$config, PreconditionerConfig$Additive())`).
+Like Python, every config is checked when constructed and holds its effective
+values (`LocalSolverConfig()$approx_chol$split_merge` is `2`); equal configs are
+`identical()`, and `Preconditioner$config` round-trips
+(`identical(p$config, PreconditionerConfig$Additive())`). Constructors accept
+what Python's accept (`LsmrOptions(maxiter = 0)` is fine; a negative `tol` fails
+when used), except that counts must fit R integers (`.Machine$integer.max`),
+seeds must be whole numbers up to 2^53, and labels at most
+`.Machine$integer.max`. Both error classes inherit from `within_error`.
 
 R conventions:
 
@@ -114,8 +127,9 @@ R conventions:
   factor; factor and character columns use their level codes), a single
   vector for a one-way design, a list of `Effect()` terms, or a `Design()`.
   Numeric labels are non-negative whole numbers, used as given; gaps are fine.
-* **Indices** — term, column, and positions in `x` — are 1-based. Levels are
-  your labels. Columns of a term are the intercept (if any), then its slopes.
+* **Indices** — term, column, and positions in `x` — are 1-based, in results
+  and in error and warning messages. Levels are your labels. Columns of a term
+  are the intercept (if any), then its slopes.
 * **Results** are classed lists with `print`, `coef()` (= `x`), and
   `residuals()` (= `demeaned`) methods. Batch results keep `colnames(Y)`.
 * **Handles** (`Design`, `Solver`, `Preconditioner`, layouts) are external

@@ -2,7 +2,7 @@
 
 as_response <- function(y, name = "y") {
   if (!is.numeric(y) || !is.null(dim(y))) {
-    stop(sprintf("`%s` must be a numeric vector", name), call. = FALSE)
+    abort(sprintf("`%s` must be a numeric vector", name))
   }
   if (!is.double(y)) y <- as.double(y)
   y
@@ -11,7 +11,7 @@ as_response <- function(y, name = "y") {
 as_response_matrix <- function(Y) {
   if (is.data.frame(Y)) Y <- as.matrix(Y)
   if (!is.matrix(Y) || !is.numeric(Y)) {
-    stop("`Y` must be a numeric matrix with one response per column", call. = FALSE)
+    abort("`Y` must be a numeric matrix with one response per column")
   }
   if (!is.double(Y)) storage.mode(Y) <- "double"
   Y
@@ -101,16 +101,18 @@ batch_result <- function(raw, Y) {
 #' fit$layout$index(term = 1, level = 2, column = 1)
 #' @export
 within_solve <- function(design, y, weights = NULL, options = NULL, preconditioner = NULL) {
-  solve_result(solve_impl(
+  solve_result(native(solve_impl(
     as_design(design), as_response(y), as_weights(weights),
     as_options(options), as_preconditioner(preconditioner)
-  ))
+  )))
 }
 
 #' Solve fixed-effects normal equations for several responses
 #'
 #' Equivalent to [within_solve()] on each column of `Y`, but builds the design
-#' and preconditioner once and solves the columns in parallel.
+#' and preconditioner once and solves the columns in parallel on the native
+#' worker pool (one thread unless `WITHINR_NUM_THREADS` says otherwise; see
+#' [within_solve()]).
 #'
 #' @inheritParams within_solve
 #' @param Y Numeric matrix (or data frame) with one response per column.
@@ -125,10 +127,10 @@ within_solve <- function(design, y, weights = NULL, options = NULL, precondition
 within_solve_batch <- function(design, Y, weights = NULL, options = NULL,
                                preconditioner = NULL) {
   Y <- as_response_matrix(Y)
-  batch_result(solve_batch_impl(
+  batch_result(native(solve_batch_impl(
     as_design(design), Y, as_weights(weights),
     as_options(options), as_preconditioner(preconditioner)
-  ), Y)
+  )), Y)
 }
 
 #' @export
@@ -152,10 +154,14 @@ print.within_solve_result <- function(x, ...) {
 #' @export
 print.within_batch_solve_result <- function(x, ...) {
   cat("<within_batch_solve_result>\n")
+  iterations <- if (length(x$iterations)) {
+    paste0("; iterations ", paste(unique(range(x$iterations)), collapse = "-"))
+  } else {
+    ""
+  }
   cat(sprintf(
-    "  %d responses, %d converged; iterations %s\n",
-    length(x$converged), sum(x$converged),
-    paste(range(c(x$iterations, NA_integer_), na.rm = TRUE), collapse = "-")
+    "  %d responses, %d converged%s\n",
+    length(x$converged), sum(x$converged), iterations
   ))
   cat(sprintf(
     "  %d observations, %d coefficients in %d term(s), %d unidentified\n",
@@ -182,18 +188,17 @@ residuals.within_batch_solve_result <- function(object, ...) object$demeaned
 # ---------------------------------------------------------------------------
 
 new_coefficient_layout <- function(ptr) {
-  info <- layout_info_impl(ptr)
+  info <- native(layout_info_impl(ptr))
   check_term <- function(term) {
     if (length(term) != 1L || is.na(term) || term < 1 || term > info$n_terms ||
         term != trunc(term)) {
-      stop(sprintf("term %s out of range (n_terms=%d)", format(term), info$n_terms),
-           call. = FALSE)
+      abort(sprintf("term %s out of range (n_terms=%d)", format(term), info$n_terms))
     }
     as.integer(term)
   }
   as_int <- function(v, name) {
     if (!is.numeric(v) || anyNA(v) || any(v != trunc(v)) || any(abs(v) > .Machine$integer.max)) {
-      stop(sprintf("`%s` must hold whole numbers", name), call. = FALSE)
+      abort(sprintf("`%s` must hold whole numbers", name))
     }
     as.integer(v)
   }
@@ -204,15 +209,16 @@ new_coefficient_layout <- function(ptr) {
   layout$n_levels <- function(term) info$n_levels[[check_term(term)]]
   layout$n_columns <- function(term) info$n_columns[[check_term(term)]]
   layout$index <- function(term, level, column) {
-    n <- max(length(term), length(level), length(column))
-    if (n == 0L) return(integer())
+    lengths <- c(length(term), length(level), length(column))
+    if (any(lengths == 0L)) return(integer())
+    n <- max(lengths)
     recycle <- function(v, name) rep_len(as_int(v, name), n)
-    layout_index_impl(
+    native(layout_index_impl(
       ptr, recycle(term, "term"), recycle(level, "level"), recycle(column, "column")
-    )
+    ))
   }
   layout$address <- function(index) {
-    as.data.frame(layout_address_impl(ptr, as_int(index, "index")))
+    as.data.frame(native(layout_address_impl(ptr, as_int(index, "index"))))
   }
   lockEnvironment(layout, bindings = TRUE)
   structure(layout, class = "within_coefficient_layout")

@@ -38,7 +38,12 @@ withinr_run_tests <- function(verbose = TRUE) {
   assert_equal(opts$maxiter, 2000L, msg = "LsmrOptions maxiter not normalized to integer.")
   assert_true(is.integer(opts$local_size), "LsmrOptions local_size not integer.")
   assert_true(is.null(withinr::LsmrOptions()$local_size), "LsmrOptions default local_size not NULL.")
-  assert_error(withinr::LsmrOptions(tol = -1), "tol")
+  # Like Python's constructors, these accept any value of the right type; the
+  # core judges them when they are used.
+  assert_equal(withinr::LsmrOptions(maxiter = 0, local_size = 0)$maxiter, 0L,
+               msg = "LsmrOptions rejected maxiter = 0.")
+  assert_error(withinr::within_solve(cats_2x2, y_simple, options = withinr::LsmrOptions(tol = -1)),
+               "tolerance")
   assert_error(withinr::LsmrOptions(maxiter = 1.5), "maxiter")
 
   local <- withinr::LocalSolverConfig()
@@ -123,7 +128,7 @@ withinr_run_tests <- function(verbose = TRUE) {
               "List options failed.")
   assert_true(withinr::within_solve(cats_2x2, y_simple, weights = c(1, 2, 1, 2))$converged,
               "Weighted solve failed.")
-  assert_error(withinr::within_solve(cats_2x2, y_simple, preconditioner = "bogus"), "should be one of")
+  assert_error(withinr::within_solve(cats_2x2, y_simple, preconditioner = "bogus"), "must be one of")
   assert_error(withinr::within_solve(cats_2x2, y_simple, preconditioner = 3), "preconditioner")
   assert_error(withinr::within_solve(cats_2x2, y_simple, options = 3), "options")
 
@@ -172,6 +177,88 @@ withinr_run_tests <- function(verbose = TRUE) {
   assert_error(withinr::within_solve(list(1, 2), y_simple), "Effect() terms")
   assert_error(withinr::within_solve(cats_2x2, y_simple[-1]), "length")
   assert_error(withinr::within_solve(cats_2x2, "a"), "numeric vector")
+
+  # -------------------------------------------------------------------------
+  # Errors: classed conditions, 1-based messages, no leaks, no format strings
+  # -------------------------------------------------------------------------
+  caught <- function(expr) tryCatch({ force(expr); NULL }, error = function(e) e)
+  e <- caught(withinr::within_solve(cats_2x2, c(1, NA, 3, 4)))
+  assert_true(inherits(e, "within_input_error") && inherits(e, "within_error"),
+              "Native input errors are not classed.")
+  assert_true(grepl("position 2", conditionMessage(e), fixed = TRUE), "y position not 1-based.")
+  assert_true(inherits(caught(withinr::Effect(1:3, intercept = FALSE)), "within_input_error"),
+              "R-side input errors are not classed.")
+  assert_error(withinr::within_solve(cats_2x2, y_simple, weights = c(1, -1, 1, 1)), "weight at position 2")
+  assert_error(withinr::within_solve_batch(cats_2x2, cbind(y_simple, c(1, 2, Inf, 4))),
+               "`Y[, 2]` must be finite")
+  na_matrix <- cats_2x2
+  na_matrix[2, 2] <- NA
+  assert_error(withinr::within_solve(na_matrix, y_simple), "row 2, column 2")
+  assert_error(withinr::within_solve(matrix(c(1, 1, 2, 2, 1, 2.5, 1, 2), 4), y_simple),
+               "row 2, column 2")
+  assert_error(withinr::within_solve(data.frame(), y_simple), "no factor columns")
+
+  # `%` reaches R verbatim (the message is no format string, which used to segfault).
+  assert_error(withinr::ScalingConfig(on_failure = "%d %d %s"), "\"%d %d %s\"")
+  assert_error(withinr::ScalingConfig(on_failure = "100%"), "\"100%\"")
+
+  # A failing call releases its arguments.
+  invisible(gc())
+  before <- sum(gc()[, 2])
+  big <- numeric(2e6)
+  for (i in 1:10) caught(withinr::within_solve(cats_2x2, big))
+  rm(big)
+  invisible(gc())
+  assert_true(sum(gc()[, 2]) - before < 40, "Failing native calls leak their arguments.")
+
+  # -------------------------------------------------------------------------
+  # Build warnings: classed, 1-based, each emitted exactly once
+  # -------------------------------------------------------------------------
+  f <- c(0, 0, 0, 1, 1, 1)
+  g <- c(0, 1, 2, 0, 1, 2)
+  z_signed <- c(-2, 1, 1, -1, -1, 2)
+  signed <- list(withinr::Effect(f, slopes = z_signed), withinr::Effect(g))
+  uncertified <- P$Additive(withinr::LocalSolverConfig(
+    scaling = withinr::ScalingConfig(max_iterations = 0)
+  ))
+  collect_warnings <- function(expr) {
+    seen <- list()
+    value <- withCallingHandlers(expr, warning = function(w) {
+      seen[[length(seen) + 1L]] <<- w
+      invokeRestart("muffleWarning")
+    })
+    list(value = value, warnings = seen)
+  }
+  one_shot <- collect_warnings(withinr::within_solve(signed, c(1, 3, 2, 5, 4, 6),
+                                                     preconditioner = uncertified))
+  assert_equal(length(one_shot$warnings), 1L, msg = "One-shot build warning not emitted once.")
+  w <- one_shot$warnings[[1]]
+  assert_true(inherits(w, "within_build_warning"), "Build warning class mismatch.")
+  assert_true(grepl("term 1 column 2 and term 2 column 1", conditionMessage(w), fixed = TRUE),
+              "Build warning positions are not 1-based.")
+  built <- collect_warnings(withinr::Solver(signed, preconditioner = uncertified))
+  assert_equal(length(built$warnings), 1L, msg = "Solver build warning not emitted once.")
+  later <- collect_warnings(built$value$solve(c(1, 3, 2, 5, 4, 6)))
+  assert_equal(length(later$warnings), 0L, msg = "Solver re-emitted a build warning.")
+  assert_true(later$value$converged, "Solve after an uncertified scaling failed.")
+
+  # -------------------------------------------------------------------------
+  # Handles and layout edge cases
+  # -------------------------------------------------------------------------
+  stale <- unserialize(serialize(withinr::Solver(cats_2x2), NULL))
+  assert_error(stale$solve(y_simple), "no longer valid")
+  assert_error(withinr::within_solve(unserialize(serialize(withinr::Design(cats_2x2), NULL)), y_simple),
+               "rebuild it")
+  assert_equal(r$layout$index(1, integer(), 1), integer(), msg = "Zero-length index lookup.")
+  empty_batch <- withinr::Solver(cats_2x2)$solve_batch(matrix(0, 4, 0))
+  assert_true(!grepl("Inf", printed(empty_batch), fixed = TRUE), "Empty batch print is broken.")
+
+  # Character matrices code each column separately, like data frames.
+  chars <- cbind(c("a", "a", "b", "b"), c("x", "y", "x", "y"))
+  char_fit <- withinr::within_solve(chars, y_simple)
+  assert_equal(char_fit$layout$address(1:4)$level, c(1L, 2L, 1L, 2L),
+               msg = "Character matrix columns share level codes.")
+  assert_equal(char_fit$demeaned, s1$demeaned, tol = 1e-8, msg = "Character matrix design mismatch.")
 
   # -------------------------------------------------------------------------
   # Persistent Solver and Preconditioner reuse
@@ -297,6 +384,15 @@ withinr_run_tests <- function(verbose = TRUE) {
   assert_equal(withinr::within_solve(withinr::Design(multi), y, options = tight)$demeaned, multi_oracle,
                tol = 1e-7, msg = "Design(list of Effect) mismatch.")
 
+  # A Design owns its slopes: the R vectors may change or be collected.
+  z_copy <- z + 0
+  owned <- withinr::Design(list(withinr::Effect(cats[, 1], slopes = z_copy), withinr::Effect(cats[, 2])))
+  z_copy[] <- 0
+  rm(z_copy)
+  invisible(gc())
+  assert_equal(withinr::within_solve_batch(owned, Y_big, weights, tight)$demeaned, slope_oracle,
+               tol = 1e-7, msg = "Design does not own its slope columns.")
+
   # A level whose slope covariate is identically zero is unidentified; its slot is 0.
   lv <- c(1, 1, 2, 2, 3, 3)
   zero_slope <- withinr::within_solve(list(withinr::Effect(lv, FALSE, c(0, 0, 1, 2, 3, 1))),
@@ -305,9 +401,9 @@ withinr_run_tests <- function(verbose = TRUE) {
                msg = "Unidentified direction not reported.")
   assert_equal(zero_slope$x[zero_slope$layout$index(1, 1, 1)], 0, msg = "Unidentified slot not 0.")
 
-  assert_error(withinr::Effect(lv, slopes = 1:3), "one value per observation")
+  assert_error(withinr::Effect(lv, slopes = 1:3), "slope 1 has 3 values, expected 6")
   assert_error(withinr::Effect(lv, intercept = FALSE), "intercept or at least one slope")
-  assert_error(withinr::Effect(lv, slopes = c(1, 2, NA, 4, 5, 6)), "finite")
+  assert_error(withinr::Effect(lv, slopes = c(1, 2, NA, 4, 5, 6)), "slope 1 value at position 3")
   assert_error(withinr::Effect(lv, intercept = NA), "TRUE or FALSE")
 
   # Native handles do not survive serialization.

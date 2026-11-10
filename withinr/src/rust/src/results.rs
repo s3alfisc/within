@@ -9,7 +9,9 @@ use within::{
     BatchSolveResult, BuildWarning, Channel, CoefficientAddress, CoefficientLayout, SolveResult,
 };
 
-use crate::convert::{err, one_based, or_throw, usize_to_i32};
+use crate::convert::{
+    describe_warning, err, guarded, handle, integer_slice, one_based, usize_to_i32,
+};
 
 fn label_to_i32(level: u32) -> Result<i32> {
     i32::try_from(level).map_err(|_| err("level label exceeds R's integer range"))
@@ -29,7 +31,7 @@ fn addresses_to_list(addresses: &[CoefficientAddress]) -> Result<List> {
 }
 
 pub(crate) fn warning_strings(warnings: &[BuildWarning]) -> Vec<String> {
-    warnings.iter().map(ToString::to_string).collect()
+    warnings.iter().map(describe_warning).collect()
 }
 
 /// `warnings` are re-emitted as R warnings by the R wrapper, then dropped.
@@ -86,8 +88,9 @@ pub(crate) fn batch_result_to_list(
 
 // `n_dofs`, `n_terms`, and per-term `n_levels` / `n_columns`, read once.
 #[extendr]
-fn layout_info_impl(layout: ExternalPtr<CoefficientLayout>) -> List {
-    or_throw((|| -> Result<List> {
+fn layout_info_impl(layout: Robj) -> List {
+    guarded(|| {
+        let layout = handle::<CoefficientLayout>(&layout, "coefficient layout")?;
         let layout = layout.try_addr()?;
         let n_terms = layout.n_terms();
         let per_term = |f: fn(&CoefficientLayout, usize) -> Option<usize>, name| {
@@ -101,7 +104,7 @@ fn layout_info_impl(layout: ExternalPtr<CoefficientLayout>) -> List {
             n_levels = per_term(CoefficientLayout::n_levels, "n_levels")?,
             n_columns = per_term(CoefficientLayout::n_columns, "n_columns")?
         ))
-    })())
+    })
 }
 
 fn one_based_arg(value: i32, name: &str) -> Result<usize> {
@@ -113,14 +116,13 @@ fn one_based_arg(value: i32, name: &str) -> Result<usize> {
 
 // Flat 1-based `x` index of each `(term, level, column)`; the inputs have equal length.
 #[extendr]
-fn layout_index_impl(
-    layout: ExternalPtr<CoefficientLayout>,
-    term: &[i32],
-    level: &[i32],
-    column: &[i32],
-) -> Vec<i32> {
-    or_throw((|| -> Result<Vec<i32>> {
+fn layout_index_impl(layout: Robj, term: Robj, level: Robj, column: Robj) -> Vec<i32> {
+    guarded(|| {
+        let layout = handle::<CoefficientLayout>(&layout, "coefficient layout")?;
         let layout = layout.try_addr()?;
+        let term = integer_slice(&term, "term")?;
+        let level = integer_slice(&level, "level")?;
+        let column = integer_slice(&column, "column")?;
         term.iter()
             .zip(level)
             .zip(column)
@@ -143,15 +145,16 @@ fn layout_index_impl(
                 one_based(index, "index")
             })
             .collect()
-    })())
+    })
 }
 
 // `(term, level, column)` of each 1-based flat `x` index.
 #[extendr]
-fn layout_address_impl(layout: ExternalPtr<CoefficientLayout>, index: &[i32]) -> List {
-    or_throw((|| -> Result<List> {
+fn layout_address_impl(layout: Robj, index: Robj) -> List {
+    guarded(|| {
+        let layout = handle::<CoefficientLayout>(&layout, "coefficient layout")?;
         let layout = layout.try_addr()?;
-        let addresses = index
+        let addresses = integer_slice(&index, "index")?
             .iter()
             .map(|&i| {
                 let at = one_based_arg(i, "index")?;
@@ -164,7 +167,7 @@ fn layout_address_impl(layout: ExternalPtr<CoefficientLayout>, index: &[i32]) ->
             })
             .collect::<Result<Vec<_>>>()?;
         addresses_to_list(&addresses)
-    })())
+    })
 }
 
 extendr_module! {

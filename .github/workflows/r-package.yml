@@ -46,10 +46,12 @@ jobs:
       - name: Generate glue and vendor dependencies
         shell: bash
         run: Rscript scripts/prepare-r-package.R --vendor
-      - name: Check that generation leaves tracked files untouched
+      - name: Check that generation changes no tracked file and leaves nothing unignored
         shell: bash
         # roxygen stamps its own version into DESCRIPTION, so that file is exempt.
-        run: git diff --exit-code -- . ':!withinr/DESCRIPTION'
+        run: |
+          status="$(git status --porcelain -- . ':!withinr/DESCRIPTION')"
+          if [ -n "$status" ]; then echo "$status"; exit 1; fi
       - name: Lint the Rust adapter
         shell: bash
         run: |

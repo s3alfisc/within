@@ -1,10 +1,11 @@
 # Configuration objects. Each constructor round-trips its arguments through the
-# native library (`config_normalize_impl`), so validation and defaults live only
-# in Rust and every object holds its fully resolved, effective configuration.
-# Two equal configurations are `identical()`, as they compare equal in Python.
+# native library (`config_normalize_impl`), which applies the core's defaults
+# and validation, so every object holds its fully resolved, effective
+# configuration. Two equal configurations are `identical()`, as they compare
+# equal in Python. The R side only coerces; it adds no rules of its own.
 
 normalize_config <- function(fields, class) {
-  config_normalize_impl(structure(fields, class = c(class, "within_config")))
+  native(config_normalize_impl(structure(fields, class = c(class, "within_config"))))
 }
 
 #' Modified LSMR solver options
@@ -13,11 +14,14 @@ normalize_config <- function(fields, class) {
 #' least-squares problem directly. The preconditioner \eqn{M \approx A^T A} is
 #' applied as one \eqn{M^{-1}} solve per iteration.
 #'
-#' @param tol Positive convergence tolerance.
+#' @param tol Convergence tolerance.
 #' @param maxiter Maximum number of LSMR iterations.
 #' @param local_size Number of past `v` vectors to reorthogonalize against via
 #'   windowed modified Gram-Schmidt, or `NULL` (default) for the plain short
 #'   recurrence. `5` to `20` is cheap insurance for ill-conditioned problems.
+#' @details Count arguments here and in the other configuration objects are
+#'   whole numbers no larger than `.Machine$integer.max`, so they round-trip
+#'   through R integers.
 #' @return A `within_lsmr_options` object, accepted as `options` by
 #'   [within_solve()], [within_solve_batch()], and `Solver()$solve()`.
 #' @examples
@@ -32,9 +36,10 @@ LsmrOptions <- function(tol = 1e-8, maxiter = 1000L, local_size = NULL) {
 
 #' Approximate Cholesky configuration
 #'
-#' @param seed Non-negative whole-number seed for the factorization's sampler
+#' @param seed Seed for the factorization's sampler, a whole number in
+#'   `[0, 2^53]` (the doubles that represent integers exactly)
 #'   (also used by the approximate Schur complement).
-#' @param split_merge Positive split/merge parameter, or `NULL`.
+#' @param split_merge Split/merge parameter, or `NULL`.
 #' @return A `within_approx_chol_config` object for [LocalSolverConfig()].
 #' @export
 ApproxCholConfig <- function(seed = 0, split_merge = NULL) {
@@ -182,10 +187,15 @@ PreconditionerConfig <- list(
 
 as_preconditioner <- function(preconditioner) {
   if (is.character(preconditioner) && length(preconditioner) == 1L && !is.na(preconditioner)) {
-    variant <- c(off = "Off", diagonal = "Diagonal", additive = "Additive",
-                 adaptive = "Adaptive")[[match.arg(
-                   tolower(preconditioner), c("off", "diagonal", "additive", "adaptive")
-                 )]]
+    variants <- c(off = "Off", diagonal = "Diagonal", additive = "Additive",
+                  adaptive = "Adaptive")
+    variant <- variants[tolower(preconditioner)]
+    if (is.na(variant)) {
+      abort(sprintf(
+        "`preconditioner` must be one of \"off\", \"diagonal\", \"additive\", or \"adaptive\", not \"%s\"",
+        preconditioner
+      ))
+    }
     return(PreconditionerConfig[[variant]]())
   }
   preconditioner

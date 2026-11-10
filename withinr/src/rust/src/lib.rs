@@ -6,7 +6,7 @@
 // - `api`     — solve entry points and the persistent solver handle
 // - `config`  — R config objects → native `within` config conversions, plus
 //               the built-preconditioner handle
-// - `convert` — shared R ↔ Rust coercion helpers and error plumbing
+// - `convert` — shared R ↔ Rust coercion helpers, error plumbing, and `Effect` validation
 // - `results` — native result → R list conversions
 
 use extendr_api::prelude::*;
@@ -22,4 +22,5 @@ extendr_module! {
     use api;
     use config;
     use results;
+    use convert;
 }

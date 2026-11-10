@@ -7,6 +7,10 @@
 #   Rscript scripts/prepare-r-package.R --vendor   # ... plus offline vendored deps (CRAN)
 #   Rscript scripts/prepare-r-package.R --no-document   # glue only, no compile
 #   Rscript scripts/prepare-r-package.R --clean    # delete everything generated
+#   Rscript scripts/prepare-r-package.R --check    # fail if the core snapshot is stale
+#
+# `--no-document` leaves rextendr's placeholder wrappers and no NAMESPACE: enough
+# for `cargo check`/`clippy` on the adapter, not for loading the package.
 #
 # Handwritten sources are `withinr/R/*.R` (except extendr-wrappers.R),
 # `withinr/src/rust/{Cargo.toml,Cargo.lock,src/}`, DESCRIPTION, tests, and docs.
@@ -15,8 +19,11 @@ if (!file.exists("Cargo.toml") || !dir.exists("withinr")) {
   stop("Run this script from the within repository root.")
 }
 args <- commandArgs(trailingOnly = TRUE)
-if (any(!args %in% c("--vendor", "--no-document", "--clean"))) {
-  stop("Unknown argument; use --vendor, --no-document, or --clean.")
+if (any(!args %in% c("--vendor", "--no-document", "--clean", "--check"))) {
+  stop("Unknown argument; use --vendor, --no-document, --clean, or --check.")
+}
+if (any(c("--clean", "--check") %in% args) && length(args) > 1L) {
+  stop("--clean and --check cannot be combined with other arguments.")
 }
 root <- normalizePath(".", winslash = "/")
 pkg <- file.path(root, "withinr")
@@ -33,15 +40,73 @@ documentation <- c("NAMESPACE", "man")
 # Build leftovers; a stale extracted `src/vendor` would shadow the tarball.
 leftovers <- c(
   "src/vendor", "src/rust/vendor", "src/.cargo", "src/Makevars", "src/Makevars.win",
-  file.path("src", list.files(file.path(pkg, "src"), "\\.(o|so|dll)$"))
+  file.path("src", list.files(file.path(pkg, "src"), "\\.(o|so|dll|lib)$"))
 )
 generated <- c(scaffolding, "R/extendr-wrappers.R", "src/rust/within-core", leftovers)
+
+# Copy the workspace's Rust core (runtime sources only) into `dest`, so the
+# source package builds without this repository or a crates.io release of
+# within. The small nested workspace keeps inherited manifest fields.
+write_core_snapshot <- function(dest) {
+  dir.create(file.path(dest, "crates"), recursive = TRUE)
+  manifest <- readLines(file.path(root, "Cargo.toml"))
+  python <- grepl("crates/within-py", manifest, fixed = TRUE)
+  if (sum(python) != 1L || !grepl('^\\s*"crates/within-py",\\s*$', manifest[python])) {
+    stop("Expected one `\"crates/within-py\",` line in Cargo.toml's workspace members; ",
+         "update write_core_snapshot() in this script.")
+  }
+  writeLines(manifest[!python], file.path(dest, "Cargo.toml"))
+  stopifnot(file.copy(file.path(root, "LICENSE"), dest, overwrite = TRUE))
+  for (crate in c("within", "schwarz-precond")) {
+    from <- file.path(root, "crates", crate)
+    to <- file.path(dest, "crates", crate)
+    dir.create(to)
+    # Drop test/benchmark manifest sections.
+    manifest <- readLines(file.path(from, "Cargo.toml"))
+    manifest <- sub("^\\[package\\]$", '[package]\nworkspace = "../.."', manifest)
+    section <- cumsum(grepl("^\\[", manifest))
+    headers <- manifest[grepl("^\\[", manifest)]
+    drop <- which(grepl("^\\[dev-dependencies|^\\[\\[bench", headers))
+    writeLines(manifest[!section %in% drop], file.path(to, "Cargo.toml"))
+    stopifnot(file.copy(file.path(from, "src"), to, recursive = TRUE))
+    stopifnot(file.copy(file.path(from, "README.md"), to))
+  }
+}
+
+snapshot <- file.path(pkg, "src/rust/within-core")
+
+if ("--check" %in% args) {
+  # The snapshot is a copy: edits to crates/ reach the package only after this
+  # script reruns. Compare it with a fresh snapshot, file by file.
+  fresh <- tempfile("within-core-")
+  write_core_snapshot(fresh)
+  digest <- function(dir) {
+    files <- sort(list.files(dir, recursive = TRUE, all.files = TRUE))
+    stats::setNames(unname(tools::md5sum(file.path(dir, files))), files)
+  }
+  current <- if (dir.exists(snapshot)) digest(snapshot) else character()
+  expected <- digest(fresh)
+  unlink(fresh, recursive = TRUE)
+  files <- union(names(current), names(expected))
+  changed <- files[is.na(current[files]) | is.na(expected[files]) |
+                     current[files] != expected[files]]
+  if (length(changed)) {
+    stop("withinr/src/rust/within-core is stale (", length(changed), " file(s) differ, e.g. ",
+         paste(utils::head(changed, 3), collapse = ", "),
+         "); rerun Rscript scripts/prepare-r-package.R")
+  }
+  message("withinr's core snapshot matches the workspace.")
+  quit(save = "no")
+}
 
 if ("--clean" %in% args) {
   unlink(file.path(pkg, c(generated, vendored, documentation, "src/rust/target")),
          recursive = TRUE)
-  if (dir.exists(file.path(pkg, "tools")) && !length(dir(file.path(pkg, "tools")))) {
-    unlink(file.path(pkg, "tools"), recursive = TRUE)
+  for (dir in c("tools", "inst")) {
+    path <- file.path(pkg, dir)
+    if (dir.exists(path) && !length(dir(path, all.files = TRUE, no.. = TRUE))) {
+      unlink(path, recursive = TRUE)
+    }
   }
   message("Removed generated withinr files.")
   quit(save = "no")
@@ -53,35 +118,17 @@ for (tool in c("rextendr", "roxygen2", "pkgload")) {
 if (packageVersion("rextendr") < "0.5.0") stop("rextendr >= 0.5.0 is required.")
 if (!nzchar(Sys.which("cargo"))) stop("cargo is not on PATH; install Rust (>= 1.85).")
 
-# Start from a clean slate so no stale artifact can leak into the build (the
-# Cargo target directory is kept for incremental compiles). Without --vendor a
-# stale vendor archive is removed too, and cargo resolves dependencies online.
+# Start from a clean slate so no stale artifact can leak into the build. The
+# Cargo target directory is left alone: pkgload's debug builds (`load_all()`)
+# reuse `target/debug` incrementally, while the generated Makevars deletes the
+# target directory after every release build (`R CMD INSTALL`) unless DEBUG is
+# set. Without --vendor a stale vendor archive is removed too, and cargo
+# resolves dependencies online.
 unlink(file.path(pkg, c(generated, if (!"--no-document" %in% args) documentation,
                         if (!"--vendor" %in% args) vendored)), recursive = TRUE)
 
-# 1. Snapshot the workspace's Rust core into the package, so the source
-#    package builds without this repository or a crates.io release of within.
-#    The small nested workspace keeps inherited manifest fields.
-snapshot <- file.path(pkg, "src/rust/within-core")
-dir.create(file.path(snapshot, "crates"), recursive = TRUE)
-manifest <- readLines(file.path(root, "Cargo.toml"))
-manifest <- manifest[!grepl('"crates/within-py"', manifest, fixed = TRUE)]
-writeLines(manifest, file.path(snapshot, "Cargo.toml"))
-stopifnot(file.copy(file.path(root, "LICENSE"), snapshot, overwrite = TRUE))
-for (crate in c("within", "schwarz-precond")) {
-  from <- file.path(root, "crates", crate)
-  to <- file.path(snapshot, "crates", crate)
-  dir.create(to)
-  # Runtime source only: drop test/benchmark manifest sections.
-  manifest <- readLines(file.path(from, "Cargo.toml"))
-  manifest <- sub("^\\[package\\]$", '[package]\nworkspace = "../.."', manifest)
-  section <- cumsum(grepl("^\\[", manifest))
-  headers <- manifest[grepl("^\\[", manifest)]
-  drop <- which(grepl("^\\[dev-dependencies|^\\[\\[bench", headers))
-  writeLines(manifest[!section %in% drop], file.path(to, "Cargo.toml"))
-  stopifnot(file.copy(file.path(from, "src"), to, recursive = TRUE))
-  stopifnot(file.copy(file.path(from, "README.md"), to))
-}
+# 1. Snapshot the workspace's Rust core into the package.
+write_core_snapshot(snapshot)
 
 # 2. Generate the extendr scaffolding in a disposable package, so
 #    use_extendr(overwrite = TRUE) cannot touch the handwritten bridge.
